@@ -6,9 +6,15 @@ Install Ollama:
 irm https://ollama.com/install.ps1 | iex
 ```
 
-Download gemma3:
-
+Download phi4 AI model:
 
 ```
-ollama pull gemma3:1b
+ollama pull phi4
+```
+
+Build and run:
+
+```
+cargo build
+cargo run
 ```

@@ -1,6 +1,6 @@
-# ollama_chat
+# ollama_lohengrin
 
-Small interactive AI chat.
+AI vs AI chat.
 
 Install Ollama:
 

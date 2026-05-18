@@ -4,6 +4,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::io::{stdout, Write};
+use std::process::Command;
+
+//-----------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct Agent {
@@ -11,6 +14,8 @@ struct Agent {
     system_prompt: String,
     memory: String,
 }
+
+//-----------------------------------------------------------------------------
 
 impl Agent {
     fn new(name: &str, system_prompt: &str) -> Self {
@@ -34,15 +39,21 @@ impl Agent {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 #[derive(Deserialize)]
 struct Chunk {
     message: Option<Message>,
 }
 
+//-----------------------------------------------------------------------------
+
 #[derive(Deserialize)]
 struct Message {
     content: Option<String>,
 }
+
+//-----------------------------------------------------------------------------
 
 async fn run_agent(
     client: &Client,
@@ -93,11 +104,15 @@ async fn run_agent(
     Ok(full)
 }
 
+//-----------------------------------------------------------------------------
+
 struct Orchestrator {
     teacher: Agent,
     student: Agent,
     critic: Agent,
 }
+
+//-----------------------------------------------------------------------------
 
 impl Orchestrator {
     fn new() -> Self {
@@ -117,6 +132,8 @@ impl Orchestrator {
         }
     }
 }
+
+//-----------------------------------------------------------------------------
 
 impl Orchestrator {
     async fn run(&mut self, client: &Client, model: &str) -> Result<()> {
@@ -179,8 +196,99 @@ impl Orchestrator {
     }
 }
 
+//-----------------------------------------------------------------------------
+
+fn ollama_is_installed() -> bool {
+    let output = Command::new("ollama")
+        .arg("--version")
+        .output();
+
+    match output {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+fn install_ollama() -> bool {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "irm https://ollama.com/install.ps1 | iex",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => true,
+        _ => false,
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+fn phi4_is_installed() -> bool {
+    let output = Command::new("ollama")
+        .args(["list"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.contains("phi4")
+        }
+        _ => false,
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+fn install_phi4() -> bool {
+    let status = Command::new("ollama")
+        .args(["pull", "phi4"])
+        .status();
+
+    match status {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    }
+}
+
+//-----------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Check for ollama
+    if ollama_is_installed() {
+        println!("Ollama is already installed.");
+    } else {
+        println!("Ollama not found! Installing Ollama!");
+
+        if install_ollama() {
+            println!("Installation successful!");
+        } else {
+            eprintln!("Installation failed!");
+            std::process::exit(1);
+        }        
+    }
+
+    // Check for AI model 'phi4'
+    if phi4_is_installed() {
+        println!("Model 'phi4' is already installed.");
+    } else {
+        println!("Model 'phi4' is missing. Installing model!");
+
+        if install_phi4() {
+            println!("Model 'phi4' successfully installed.");
+        } else {
+            eprintln!("Installation failed!");
+            std::process::exit(1);
+        }
+    }
+
     let client = reqwest::Client::new();
     let mut orch = Orchestrator::new();
 

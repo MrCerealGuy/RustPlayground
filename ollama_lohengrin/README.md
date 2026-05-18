@@ -1,6 +1,6 @@
 # ollama_lohengrin
 
-AI vs AI chat.
+Discussion with three AI Agents: Teacher, student and critic.
 
 Install Ollama:
 

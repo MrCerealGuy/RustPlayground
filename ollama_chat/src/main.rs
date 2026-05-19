@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use owo_colors::OwoColorize;
 
 //-----------------------------------------------------------------------------
 
@@ -104,38 +105,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check for ollama
     if ollama_is_installed() {
-        println!("Ollama is already installed.");
+        println!("✅ Ollama is already installed.");
     } else {
-        println!("Ollama not found! Installing Ollama!");
+        println!("{} Installing Ollama!", "Ollama not found!".red());
 
         if install_ollama() {
-            println!("Installation successful!");
+            println!("✅ Installation successful!");
         } else {
-            eprintln!("Installation failed!");
+            eprintln!("{}", "❌ Installation failed!".red());
             std::process::exit(1);
         }        
     }
 
     // Check for AI model 'phi4'
     if phi4_is_installed() {
-        println!("Model 'phi4' is already installed.");
+        println!("✅ Model 'phi4' is already installed.");
     } else {
-        println!("Model 'phi4' is missing. Installing model!");
+        println!("{} Installing model!", "Model 'phi4' is missing.".red());
 
         if install_phi4() {
-            println!("Model 'phi4' successfully installed.");
+            println!("✅ Model 'phi4' successfully installed.");
         } else {
-            eprintln!("Installation failed!");
+            eprintln!("{}", "❌ Installation failed!".red());
             std::process::exit(1);
         }
     }
 
-    println!("Ollama Streaming Chat (Rust)");
+    println!("\nOllama Streaming Chat (Rust)");
     println!("Type 'exit' to quit.\n");
 
     loop {
         // USER INPUT
-        print!("You: ");
+        print!("{}", "You: ".green());
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -170,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut stream = response.bytes_stream();
 
-        println!("\nAssistant:\n");
+        println!("\n{}\n", "Assistant:".blue());
 
         let mut full_response = String::new();
 
@@ -211,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    println!("Goodbye!");
+    println!("\nGoodbye! 👋");
 
     Ok(())
 }

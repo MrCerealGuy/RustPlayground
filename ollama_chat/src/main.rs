@@ -1,3 +1,14 @@
+// -----------------------------------------------------------------------------
+// ollama_chat - A simple AI Windows chat prompt.
+//
+// by Andreas Zahnleiter <a.zahnleiter@gmx.de>
+// -----------------------------------------------------------------------------
+// 2026-05-17 - az - created
+// 2026-05-18 - az - added ollama installation process
+// 2026-05-19 - az - added colored text and unicode symbols
+// 2026-05-20 - az - check for Windows 11 
+// -----------------------------------------------------------------------------
+
 use std::io::{self, Write};
 use std::process::Command;
 use futures_util::StreamExt;
@@ -27,6 +38,31 @@ struct OllamaChunk {
 #[derive(Debug, Deserialize)]
 struct OllamaMessage {
     content: Option<String>,
+}
+
+//-----------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn is_windows_11() -> bool {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+    let current_version = hklm
+        .open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+
+    if let Ok(key) = current_version {
+        let build: Result<String, _> = key.get_value("CurrentBuild");
+
+        if let Ok(build) = build {
+            if let Ok(build_number) = build.parse::<u32>() {
+                return build_number >= 22000;
+            }
+        }
+    }
+
+    return false;
 }
 
 //-----------------------------------------------------------------------------
@@ -102,6 +138,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             content: "You are a helpful Rust programming tutor. Be concise and show code examples.".to_string(),
         }
     ];
+
+    #[cfg(target_os = "windows")]
+    {
+        if is_windows_11() {
+            println!("✅ Windows 11 detected.");
+        } else {
+            println!("{}", "❌ No Windows 11!".red());
+            std::process::exit(1);
+        }
+    }
 
     // Check for ollama
     if ollama_is_installed() {
@@ -216,3 +262,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+//-----------------------------------------------------------------------------

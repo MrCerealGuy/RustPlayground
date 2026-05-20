@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// ollama_chat - A simple AI Windows chat prompt.
+// ollama_chat - Your personal AI chat assistant.
 //
 // by Andreas Zahnleiter <a.zahnleiter@gmx.de>
 // -----------------------------------------------------------------------------
@@ -7,6 +7,7 @@
 // 2026-05-18 - az - added ollama installation process
 // 2026-05-19 - az - added colored text and unicode symbols
 // 2026-05-20 - az - check for Windows 11 
+// 2026-05-20 - az - user-defined role AI assistant
 // -----------------------------------------------------------------------------
 
 use std::io::{self, Write};
@@ -130,15 +131,8 @@ fn install_phi4() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new();
 
-    let mut history: Vec<Message> = vec![
-        Message {
-            role: "system".to_string(),
-            content: "You are a helpful Rust programming tutor. Be concise and show code examples.".to_string(),
-        }
-    ];
-
+    // Check for Windows 11
     #[cfg(target_os = "windows")]
     {
         if is_windows_11() {
@@ -177,11 +171,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\nOllama Streaming Chat (Rust)");
+    println!("\nOllama Streaming Chat");
     println!("Type 'exit' to quit.\n");
 
+    // Role of AI assistant
+    print!("Please describe the role of your AI assistant: ");
+    io::stdout().flush()?;
+
+    let mut initialcontent = String::new();
+    io::stdin().read_line(&mut initialcontent)?;
+    let initialcontent = initialcontent.trim();
+
+    println!("\n");
+
+    let mut history: Vec<Message> = vec![
+        Message {
+            role: "system".to_string(),
+            content: initialcontent.to_string(),
+        }
+    ];
+
+    let client = Client::new();
+
     loop {
-        // USER INPUT
+        // User input
         print!("{}", "You: ".green());
         io::stdout().flush()?;
 
@@ -202,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             content: input.to_string(),
         });
 
-        // REQUEST
+        // Ollama request
         let body = json!({
             "model": "phi4",
             "stream": true,
@@ -221,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut full_response = String::new();
 
-        // STREAM PROCESSING (IMPORTANT PART)
+        // Stream processing
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
 
@@ -251,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("\n");
 
-        // SAVE ASSISTANT MESSAGE
+        // Sava assistant message
         history.push(Message {
             role: "assistant".to_string(),
             content: full_response,

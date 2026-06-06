@@ -1,0 +1,18 @@
+[package]
+name = "ollama_chat2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ollama-rs = "0.3.4"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+anyhow = "1"
+owo-colors = "4"
+winreg = "0.52"
+cpal = "0.15"
+hound = "3.5"
+

@@ -1,1 +1,12 @@
+*.exe
+*.dll
+*.bin
+*.zip
+
+stderr.txt
+stdout.txt
+
 target/
+Release/
+whisper-test-out/
+piper/

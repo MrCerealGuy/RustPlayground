@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "ollama_chat Launch (Windows)",
+            "name": "ollama_chat2 Launch (Windows)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceRoot}/ollama_chat/target/debug/ollama_chat.exe",
+            "program": "${workspaceRoot}/ollama_chat2/target/debug/ollama_chat2.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}",

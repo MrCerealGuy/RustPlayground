@@ -50,8 +50,8 @@ struct OllamaMessage {
 //-----------------------------------------------------------------------------
 
 const WHISPER_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
-const WHISPER_MODEL_PATH: &str = "ggml-base.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin";
+const WHISPER_MODEL_PATH: &str = "ggml-large-v3.bin";
 const WHISPER_EXE_URL: &str =
     "https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.6/whisper-bin-x64.zip";
 const WHISPER_EXE_PATH: &str = "whisper.exe";
@@ -63,9 +63,9 @@ const PIPER_EXE_URL: &str =
 const PIPER_DIR: &str = "piper";
 const PIPER_ZIP_PATH: &str = "piper_windows_amd64.zip";
 const PIPER_VOICE_URL: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx";
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/ramona/low/de_DE-ramona-low.onnx";
 const PIPER_VOICE_JSON_URL: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json";
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/ramona/low/de_DE-ramona-low.onnx.json";
 
 //-----------------------------------------------------------------------------
 
@@ -162,14 +162,33 @@ async fn download_whisper_model(client: &Client) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
-    println!("{} Downloading Whisper model (~75 MB)...", "Model missing.".red());
+    // Remove partial download if present
+    let _ = std::fs::remove_file(model_path);
+
+    println!("{} Downloading Whisper model (~1.5 GB)...", "Model missing.".red());
     println!("   {}", WHISPER_MODEL_URL);
 
     let response = client.get(WHISPER_MODEL_URL).send().await?;
-    let bytes = response.bytes().await?;
-    std::fs::write(model_path, &bytes)?;
+    let total = response.content_length().unwrap_or(0);
 
-    println!("✅ Whisper model downloaded.");
+    let mut file = std::fs::File::create(model_path)?;
+    let mut downloaded: u64 = 0;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk)?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let pct = downloaded as f64 / total as f64 * 100.0;
+            print!("\r{:.0}% ({:.1} MB / {:.1} MB)", pct, downloaded as f64 / 1_048_576.0, total as f64 / 1_048_576.0);
+        } else {
+            print!("\r{:.1} MB downloaded", downloaded as f64 / 1_048_576.0);
+        }
+        io::stdout().flush()?;
+    }
+
+    println!("\n✅ Whisper model downloaded.");
     Ok(())
 }
 
@@ -294,10 +313,10 @@ async fn download_piper_binary(client: &Client) -> Result<(), Box<dyn std::error
 
 async fn download_piper_voice(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let piper_dir = Path::new(PIPER_DIR);
-    let voice_path = piper_dir.join("de_DE-thorsten-medium.onnx");
+    let voice_path = piper_dir.join("de_DE-ramona-low.onnx");
 
     if voice_path.exists() {
-        println!("✅ Piper German voice model found.");
+        println!("✅ Piper German female voice model found.");
         return Ok(());
     }
 
@@ -310,7 +329,7 @@ async fn download_piper_voice(client: &Client) -> Result<(), Box<dyn std::error:
     let bytes = response.bytes().await?;
     std::fs::write(&voice_path, &bytes)?;
 
-    let json_path = piper_dir.join("de_DE-thorsten-medium.onnx.json");
+    let json_path = piper_dir.join("de_DE-ramona-low.onnx.json");
     if !json_path.exists() {
         println!("   Downloading voice config...");
         if let Ok(resp) = client.get(PIPER_VOICE_JSON_URL).send().await {
@@ -630,7 +649,7 @@ fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error:
 
     let cwd = std::env::current_dir()?;
     let piper_exe = cwd.join(PIPER_DIR).join("piper.exe");
-    let piper_voice = cwd.join(PIPER_DIR).join("de_DE-thorsten-medium.onnx");
+    let piper_voice = cwd.join(PIPER_DIR).join("de_DE-ramona-low.onnx");
 
     if piper_exe.exists() && piper_voice.exists() {
         let temp_wav = std::env::temp_dir().join("ollama_chat_tts.wav");
@@ -786,12 +805,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stdin().read_line(&mut initialcontent)?;
     let initialcontent = initialcontent.trim();
 
+    let system_content = if initialcontent.is_empty() {
+        "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden."
+    } else {
+        initialcontent
+    };
+
     println!("\n");
 
     let mut history: Vec<Message> = vec![
         Message {
             role: "system".to_string(),
-            content: initialcontent.to_string(),
+            content: system_content.to_string(),
         }
     ];
 

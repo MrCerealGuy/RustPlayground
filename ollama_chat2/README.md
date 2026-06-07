@@ -1,6 +1,6 @@
-# ollama_chat
+# ollama_chat2
 
-Small interactive AI chat.
+Small interactive AI chat V2 (built with OpenCode).
 
 Install Ollama:
 

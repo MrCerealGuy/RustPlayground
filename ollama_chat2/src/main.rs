@@ -50,8 +50,8 @@ struct OllamaMessage {
 //-----------------------------------------------------------------------------
 
 const WHISPER_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
-const WHISPER_MODEL_PATH: &str = "ggml-tiny.en.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
+const WHISPER_MODEL_PATH: &str = "ggml-base.bin";
 const WHISPER_EXE_URL: &str =
     "https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.6/whisper-bin-x64.zip";
 const WHISPER_EXE_PATH: &str = "whisper.exe";
@@ -588,7 +588,7 @@ fn transcribe_via_whisper(wav_path: &str) -> Result<String, Box<dyn std::error::
             "-f", wav_path,
             "-nt",
             "-np",
-            "-l", "en",
+            "-l", "de",
         ])
         .output()?;
 

@@ -7,7 +7,6 @@
 // 2026-05-18 - az - added ollama installation process
 // 2026-05-19 - az - added colored text and unicode symbols
 // 2026-05-20 - az - check for Windows 11 
-// 2026-05-20 - az - user-defined role AI assistant
 // 2026-06-06 - az - replaced stdin input with speech-to-text (whisper.cpp)
 // -----------------------------------------------------------------------------
 
@@ -889,23 +888,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nOllama Streaming Chat (Speech-to-Text)");
-    println!("Type 'exit' to quit.\n");
+    println!("Type 'exit' to quit.");
 
-    // Role of AI assistant
-    print!("Please describe the role of your AI assistant: ");
-    io::stdout().flush()?;
-
-    let mut initialcontent = String::new();
-    io::stdin().read_line(&mut initialcontent)?;
-    let initialcontent = initialcontent.trim();
-
-    let system_content = if initialcontent.is_empty() {
-        "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden."
-    } else {
-        initialcontent
-    };
-
-    println!("\n");
+    let system_content = "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden.";
 
     let mut history: Vec<Message> = vec![
         Message {

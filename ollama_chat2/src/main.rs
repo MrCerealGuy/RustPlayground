@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -963,7 +964,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut full_response = String::new();
 
+        let tts_cancel = Arc::new(AtomicBool::new(false));
+        let tts_cancel_vad = Arc::clone(&tts_cancel);
+
+        // Channel for streaming TTS segments
+        let (tts_tx, tts_rx) = mpsc::channel::<String>();
+        let tts_cancel_tts = Arc::clone(&tts_cancel);
+        let tts_handle = std::thread::spawn(move || {
+            while let Ok(segment) = tts_rx.recv() {
+                if tts_cancel_tts.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = speak_text(&segment, &tts_cancel_tts) {
+                    eprintln!("{} {}", "TTS error:".red(), e);
+                    break;
+                }
+            }
+        });
+
         // Stream processing
+        let mut tts_buffer = String::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
 
@@ -981,6 +1001,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             io::stdout().flush()?;
 
                             full_response.push_str(&content);
+                            tts_buffer.push_str(&content);
+
+                            if tts_buffer.len() >= 80 && (tts_buffer.ends_with('.') || tts_buffer.ends_with('!') || tts_buffer.ends_with('?')) {
+                                let segment = std::mem::take(&mut tts_buffer);
+                                let _ = tts_tx.send(segment);
+                            }
                         }
                     }
 
@@ -991,18 +1017,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Flush remaining text to TTS
+        if !tts_buffer.is_empty() {
+            let _ = tts_tx.send(std::mem::take(&mut tts_buffer));
+        }
+        drop(tts_tx);
+
         println!("\n");
 
-        // Start TTS in background, then listen for next user input
-        let tts_cancel = Arc::new(AtomicBool::new(false));
-        let tts_text = full_response.clone();
-        let tts_cancel_vad = Arc::clone(&tts_cancel);
-        let tts_handle = std::thread::spawn(move || {
-            if let Err(e) = speak_text(&tts_text, &tts_cancel) {
-                eprintln!("{} {}", "TTS error:".red(), e);
-            }
-        });
-
+        // Head start before VAD listening
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         print!("{}", "\n🎤 Listening... (speak to interrupt or respond)".yellow());

@@ -39,9 +39,9 @@ const PIPER_EXE_URL: &str =
 const PIPER_DIR: &str = "piper";
 const PIPER_ZIP_PATH: &str = "piper_windows_amd64.zip";
 const PIPER_VOICE_URL: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/ramona/low/de_DE-ramona-low.onnx";
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/kerstin/low/de_DE-kerstin-low.onnx";
 const PIPER_VOICE_JSON_URL: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/ramona/low/de_DE-ramona-low.onnx.json";
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/kerstin/low/de_DE-kerstin-low.onnx.json";
 
 const SYSTEM_PROMPT: &str = "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden.";
 
@@ -74,7 +74,6 @@ struct ChatEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    Ready,
     Listening,
     Transcribing,
     Thinking,
@@ -94,8 +93,8 @@ impl AppState {
     fn new() -> Self {
         Self {
             messages: Vec::new(),
-            phase: Phase::Ready,
-            status_text: "Press ENTER to start speaking".into(),
+            phase: Phase::Listening,
+            status_text: "Listening...".into(),
             vad_level: 0.0,
             vu_level: 0.0,
             error: None,
@@ -104,7 +103,6 @@ impl AppState {
 }
 
 enum UiCommand {
-    StartRecording,
     Exit,
 }
 
@@ -266,18 +264,18 @@ async fn download_piper_binary(client: &Client) -> Result<(), Box<dyn std::error
 
 async fn download_piper_voice(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let piper_dir = Path::new(PIPER_DIR);
-    let voice_path = piper_dir.join("de_DE-ramona-low.onnx");
+    let voice_path = piper_dir.join("de_DE-kerstin-low.onnx");
     if voice_path.exists() {
-        println!("✅ Piper German female voice model found.");
+        println!("✅ Piper Kerstin voice model found.");
         return Ok(());
     }
     std::fs::create_dir_all(piper_dir)?;
-    println!("{} Downloading German voice model (~63 MB)...", "Voice model missing.".red());
+    println!("{} Downloading Kerstin voice model (~63 MB)...", "Voice model missing.".red());
     println!("   {}", PIPER_VOICE_URL);
     let response = client.get(PIPER_VOICE_URL).send().await?;
     let bytes = response.bytes().await?;
     std::fs::write(&voice_path, &bytes)?;
-    let json_path = piper_dir.join("de_DE-ramona-low.onnx.json");
+    let json_path = piper_dir.join("de_DE-kerstin-low.onnx.json");
     if !json_path.exists() {
         println!("   Downloading voice config...");
         if let Ok(resp) = client.get(PIPER_VOICE_JSON_URL).send().await {
@@ -531,7 +529,7 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
 
     let cwd = std::env::current_dir()?;
     let piper_exe = cwd.join(PIPER_DIR).join("piper.exe");
-    let piper_voice = cwd.join(PIPER_DIR).join("de_DE-ramona-low.onnx");
+    let piper_voice = cwd.join(PIPER_DIR).join("de_DE-kerstin-low.onnx");
 
     if piper_exe.exists() && piper_voice.exists() {
         let temp_wav = std::env::temp_dir().join("ollama_chat_tts.wav");
@@ -606,34 +604,28 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
     }];
 
     loop {
-        // Wait for start command
-        let cmd = match cmd_rx.recv() {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        match cmd {
-            UiCommand::Exit => break,
-            UiCommand::StartRecording => {}
+        // Check for exit (non-blocking)
+        match cmd_rx.try_recv() {
+            Ok(UiCommand::Exit) | Err(mpsc::TryRecvError::Disconnected) => break,
+            _ => {}
         }
 
         // Listening phase
         {
             let mut s = state.lock().unwrap();
             s.phase = Phase::Listening;
-            s.status_text = "🎤 Listening...".into();
+            s.status_text = "Listening...".into();
             s.vad_level = 0.0;
             s.error = None;
         }
 
+        // Cooldown to avoid TTS echo re-triggering VAD
+        std::thread::sleep(Duration::from_millis(600));
+
         // Record audio
         let audio = match record_audio_inner(None, Arc::clone(&state)) {
             Ok(a) => a,
-            Err(_) => {
-                let mut s = state.lock().unwrap();
-                s.phase = Phase::Ready;
-                s.status_text = "Press ENTER to start speaking".into();
-                continue;
-            }
+            Err(_) => continue,
         };
 
         // Transcribing phase
@@ -647,8 +639,8 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         let wav_str = wav_path.to_str().unwrap_or("ollama_chat_input.wav");
         if let Err(e) = save_wav(wav_str, &audio, TARGET_SAMPLE_RATE) {
             let mut s = state.lock().unwrap();
-            s.phase = Phase::Ready;
-            s.status_text = "Press ENTER to start speaking".into();
+            s.phase = Phase::Listening;
+            s.status_text = "Listening...".into();
             s.error = Some(format!("WAV error: {}", e));
             continue;
         }
@@ -657,8 +649,8 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             Ok(t) => t,
             Err(e) => {
                 let mut s = state.lock().unwrap();
-                s.phase = Phase::Ready;
-                s.status_text = "Press ENTER to start speaking".into();
+                s.phase = Phase::Listening;
+                s.status_text = "Listening...".into();
                 s.error = Some(format!("STT error: {}", e));
                 continue;
             }
@@ -668,8 +660,8 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         if !is_meaningful_speech(&input) {
             {
                 let mut s = state.lock().unwrap();
-                s.phase = Phase::Ready;
-                s.status_text = "Press ENTER to start speaking".into();
+                s.phase = Phase::Listening;
+                s.status_text = "Listening...".into();
             }
             std::thread::sleep(Duration::from_millis(500));
             continue;
@@ -699,8 +691,8 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             Ok(r) => r,
             Err(e) => {
                 let mut s = state.lock().unwrap();
-                s.phase = Phase::Ready;
-                s.status_text = "Press ENTER to start speaking".into();
+                s.phase = Phase::Listening;
+                s.status_text = "Listening...".into();
                 s.error = Some(format!("Ollama error: {}", e));
                 continue;
             }
@@ -728,6 +720,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
 
         {
             let mut s = state.lock().unwrap();
+            s.messages.push(ChatEntry { role: "assistant".to_string(), content: String::new() });
             s.phase = Phase::Speaking;
             s.status_text = "Speaking... (Enter to interrupt)".into();
         }
@@ -753,6 +746,14 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                                 let segment = std::mem::take(&mut tts_buffer);
                                 let _ = tts_tx.send(segment);
                             }
+
+                            // Update visible text during streaming
+                            {
+                                let mut s = state.lock().unwrap();
+                                if let Some(last) = s.messages.last_mut() {
+                                    last.content = full_response.clone();
+                                }
+                            }
                         }
                     }
                     if parsed.done == Some(true) { break; }
@@ -767,12 +768,13 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
 
         let _ = tts_handle.join();
 
-        // Add assistant message
         {
             let mut s = state.lock().unwrap();
-            s.messages.push(ChatEntry { role: "assistant".to_string(), content: full_response.clone() });
-            s.phase = Phase::Ready;
-            s.status_text = "Press ENTER to start speaking".into();
+            if full_response.is_empty() {
+                s.messages.pop();
+            }
+            s.phase = Phase::Listening;
+            s.status_text = "Listening...".into();
             s.vu_level = 0.0;
         }
 
@@ -806,12 +808,18 @@ fn ui(f: &mut ratatui::Frame, state: &AppState) {
     let mut lines: Vec<Line> = Vec::new();
     for entry in &state.messages {
         let prefix = if entry.role == "user" { "You: " } else { "AI: " };
+        let mut first = true;
         for line_text in entry.content.lines() {
-            lines.push(Line::from(Span::raw(format!("{}{}", prefix, line_text))));
+            if line_text.is_empty() {
+                lines.push(Line::from(Span::raw("")));
+            } else if first {
+                lines.push(Line::from(Span::raw(format!("{}{}", prefix, line_text))));
+                first = false;
+            } else {
+                lines.push(Line::from(Span::raw(line_text.to_string())));
+            }
         }
-    }
-    if state.phase == Phase::Thinking || state.phase == Phase::Speaking {
-
+        lines.push(Line::from(Span::raw("")));
     }
     if let Some(ref err) = state.error {
         lines.push(Line::from(Span::raw(format!("Error: {}", err))));
@@ -833,9 +841,8 @@ fn ui(f: &mut ratatui::Frame, state: &AppState) {
 
     // Phase + status text
     let phase_style = match state.phase {
-        Phase::Ready => Style::default().fg(Color::Green),
-        Phase::Listening => Style::default().fg(Color::Yellow),
-        Phase::Transcribing => Style::default().fg(Color::Cyan),
+        Phase::Listening => Style::default().fg(Color::Green),
+        Phase::Transcribing => Style::default().fg(Color::Yellow),
         Phase::Thinking => Style::default().fg(Color::Magenta),
         Phase::Speaking => Style::default().fg(Color::Blue),
     };
@@ -887,13 +894,6 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
                     KeyCode::Esc | KeyCode::Char('q') => {
                         let _ = cmd_tx.send(UiCommand::Exit);
                         break Ok(());
-                    }
-                    KeyCode::Enter => {
-                        let s = state.lock().unwrap();
-                        if s.phase == Phase::Ready {
-                            drop(s);
-                            let _ = cmd_tx.send(UiCommand::StartRecording);
-                        }
                     }
                     _ => {}
                 }

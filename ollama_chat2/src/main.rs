@@ -388,8 +388,241 @@ fn is_meaningful_speech(text: &str) -> bool {
 }
 
 //-----------------------------------------------------------------------------
-// Audio recording with VAD
+// Web search
 //-----------------------------------------------------------------------------
+
+fn search_web(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
+    let lower = query.to_lowercase();
+
+    // Weather query → use Open-Meteo API (free, no key)
+    if lower.starts_with("wetter ") || lower.starts_with("weather ") {
+        let location = query.splitn(2, ' ').nth(1).unwrap_or("").trim();
+        if !location.is_empty() {
+            return search_weather(location, client, rt);
+        }
+    }
+
+    // General query → DuckDuckGo Instant Answer API
+    let encoded = urlencoding::encode(query);
+    let url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+        encoded
+    );
+
+    let result = rt.block_on(async { client.get(&url).send().await });
+    let body = match result {
+        Ok(resp) => match rt.block_on(async { resp.text().await }) {
+            Ok(t) => t,
+            Err(e) => return format!("Fehler beim Lesen der Suchergebnisse: {}", e),
+        },
+        Err(e) => return format!("Fehler bei der Suchanfrage: {}", e),
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return format!("Keine Suchergebnisse für '{}' gefunden.", query),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(answer) = json["Answer"].as_str() {
+        if !answer.is_empty() {
+            parts.push(format!("Antwort: {}", answer));
+        }
+    }
+
+    if let Some(abstract_text) = json["Abstract"].as_str() {
+        if !abstract_text.is_empty() {
+            parts.push(format!("Zusammenfassung: {}", abstract_text));
+            if let Some(source) = json["AbstractSource"].as_str() {
+                if !source.is_empty() {
+                    parts.push(format!("Quelle: {}", source));
+                }
+            }
+        }
+    }
+
+    if let Some(topics) = json["RelatedTopics"].as_array() {
+        let mut count = 0;
+        for topic in topics {
+            if count >= 5 { break; }
+            if let Some(text) = topic["Text"].as_str() {
+                parts.push(format!("- {}", text));
+                count += 1;
+            }
+            if let Some(subtopics) = topic["Topics"].as_array() {
+                for sub in subtopics {
+                    if count >= 5 { break; }
+                    if let Some(text) = sub["Text"].as_str() {
+                        parts.push(format!("- {}", text));
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        format!("Keine Suchergebnisse für '{}' gefunden.", query)
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn search_weather(location: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
+    // Geocoding
+    let encoded = urlencoding::encode(location);
+    let geo_url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=de&format=json",
+        encoded
+    );
+
+    let body = match rt.block_on(async { client.get(&geo_url).send().await }) {
+        Ok(r) => match rt.block_on(async { r.text().await }) {
+            Ok(t) => t,
+            Err(e) => return format!("Fehler bei der Geokodierung: {}", e),
+        },
+        Err(e) => return format!("Fehler bei der Geokodierung: {}", e),
+    };
+
+    let geo: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return format!("Konnte '{}' nicht finden.", location),
+    };
+
+    let results = match geo["results"].as_array() {
+        Some(r) if !r.is_empty() => r,
+        _ => return format!("Konnte '{}' nicht finden.", location),
+    };
+
+    let lat = results[0]["latitude"].as_f64().unwrap_or(0.0);
+    let lon = results[0]["longitude"].as_f64().unwrap_or(0.0);
+    let name = results[0]["name"].as_str().unwrap_or(location);
+    let country = results[0]["country"].as_str().unwrap_or("");
+    let region = results[0]["admin1"].as_str().unwrap_or("");
+
+    // Weather forecast
+    let weather_url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode&timezone=Europe/Berlin&forecast_days=3",
+        lat, lon
+    );
+
+    let body = match rt.block_on(async { client.get(&weather_url).send().await }) {
+        Ok(r) => match rt.block_on(async { r.text().await }) {
+            Ok(t) => t,
+            Err(e) => return format!("Fehler bei der Wetterabfrage: {}", e),
+        },
+        Err(e) => return format!("Fehler bei der Wetterabfrage: {}", e),
+    };
+
+    let weather: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return format!("Fehler beim Parsen der Wetterdaten."),
+    };
+
+    let mut parts = Vec::new();
+    parts.push(format!("Wetter für {}, {} ({})", name, region, country));
+
+    if let Some(current) = weather["current_weather"].as_object() {
+        let temp = current["temperature"].as_f64().unwrap_or(0.0);
+        let windspeed = current["windspeed"].as_f64().unwrap_or(0.0);
+        let wcode = current["weathercode"].as_i64().unwrap_or(0);
+        parts.push(format!(
+            "Aktuell: {}°C, {}, Wind: {} km/h",
+            temp, weather_code_desc(wcode), windspeed
+        ));
+    }
+
+    if let Some(daily) = weather["daily"].as_object() {
+        let times = daily["time"].as_array();
+        let max_temps = daily["temperature_2m_max"].as_array();
+        let min_temps = daily["temperature_2m_min"].as_array();
+        let precip = daily["precipitation_sum"].as_array();
+        let wcodes = daily["weathercode"].as_array();
+
+        if let Some(times) = times {
+            for i in 0..times.len().min(3) {
+                let date = times[i].as_str().unwrap_or("");
+                let t_max = max_temps.and_then(|a| a.get(i)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let t_min = min_temps.and_then(|a| a.get(i)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let p = precip.and_then(|a| a.get(i)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let wc = wcodes.and_then(|a| a.get(i)).and_then(|v| v.as_i64()).unwrap_or(0);
+                parts.push(format!(
+                    "{}: {}°C - {}°C, {}, Niederschlag: {} mm",
+                    date, t_min, t_max, weather_code_desc(wc), p
+                ));
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn weather_code_desc(code: i64) -> &'static str {
+    match code {
+        0 => "Klarer Himmel",
+        1 => "Überwiegend klar",
+        2 => "Teilweise bewölkt",
+        3 => "Bedeckt",
+        45 | 48 => "Nebel",
+        51 => "Leichter Nieselregen",
+        53 => "Mäßiger Nieselregen",
+        55 => "Starker Nieselregen",
+        56 | 57 => "Gefrierender Nieselregen",
+        61 => "Leichter Regen",
+        63 => "Mäßiger Regen",
+        65 => "Starker Regen",
+        66 | 67 => "Gefrierender Regen",
+        71 => "Leichter Schneefall",
+        73 => "Mäßiger Schneefall",
+        75 => "Starker Schneefall",
+        77 => "Schneekörner",
+        80 => "Leichte Regenschauer",
+        81 => "Mäßige Regenschauer",
+        82 => "Starke Regenschauer",
+        85 => "Leichte Schneeschauer",
+        86 => "Starke Schneeschauer",
+        95 => "Gewitter",
+        96 => "Gewitter mit leichtem Hagel",
+        99 => "Gewitter mit starkem Hagel",
+        _ => "Unbekannt",
+    }
+}
+
+fn detect_search_intent(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+
+    // Direct "such nach" / "suche nach" commands
+    for keyword in &["such nach ", "suche nach ", "such mal nach ", "google "] {
+        if let Some(idx) = lower.find(keyword) {
+            let query = text[idx + keyword.len()..].trim().to_string();
+            if !query.is_empty() { return Some(query); }
+        }
+    }
+
+    // Weather questions with location extraction (first "in" match)
+    if lower.contains("wetter") {
+        if let Some(idx) = lower.find(" in ") {
+            let location = text[idx + 4..].trim().trim_end_matches('?').trim();
+            if !location.is_empty() {
+                return Some(format!("Wetter {}", location));
+            }
+        }
+        return Some(format!("Wetter {}", text.trim_end_matches('?')));
+    }
+
+    // Questions about current events, news
+    if lower.contains("nachricht") || lower.contains("aktuell") || lower.contains("neuigkeit") {
+        return Some(text.trim_end_matches('?').to_string());
+    }
+
+    // Explicit "recherchiere" / "suche" / "googel"
+    if lower.contains("recherchier") || lower.contains("googel") || lower == "suche" {
+        return Some(text.trim_end_matches('?').to_string());
+    }
+
+    None
+}
 
 fn record_audio_inner(cancel: Option<Arc<AtomicBool>>, state: Arc<Mutex<AppState>>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -719,7 +952,26 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             s.messages.push(ChatEntry { role: "user".to_string(), content: input.clone() });
         }
 
+        // Check if web search is needed based on user input
+        let search_query = detect_search_intent(&input);
+
         history.push(Message { role: "user".to_string(), content: input });
+
+        if let Some(ref query) = search_query {
+            {
+                let mut s = state.lock().unwrap();
+                let disp = if query.len() > 40 { format!("{}...", &query[..40]) } else { query.clone() };
+                s.status_text = format!("Web search: {}", disp);
+            }
+
+            let result = search_web(query, &client, &rt);
+
+            // Inject search result as context message
+            history.push(Message {
+                role: "system".to_string(),
+                content: format!("Web search result for '{}':\n{}", query, result),
+            });
+        }
 
         // Thinking phase
         {
@@ -747,7 +999,6 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         // Stream processing + streaming TTS
         let tts_cancel = Arc::new(AtomicBool::new(false));
 
-        // Pre-allocate TTS channel
         let (tts_tx, tts_rx) = mpsc::channel::<String>();
         let tts_cancel_tts = Arc::clone(&tts_cancel);
         let tts_state = Arc::clone(&state);
@@ -830,7 +1081,25 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             s.vu_level = 0.0;
         }
 
-        history.push(Message { role: "assistant".to_string(), content: full_response });
+        if !full_response.is_empty() {
+            history.push(Message { role: "assistant".to_string(), content: full_response });
+        }
+
+        // Clean up injected search context (don't keep it for future turns)
+        if search_query.is_some() {
+            // Remove the system message we added (it was second-to-last message in history before assistant response)
+            // The last is the assistant response, the second-to-last is the search context
+            // Actually, we pushed: user message, search system message, assistant response
+            // After assistant push: [system, user, search-system, assistant] - we want to keep system and user, remove search-system
+            // After popping search: [system, user, assistant]
+            if history.len() >= 4 {
+                // Remove the search system message at index history.len() - 2
+                let idx = history.len() - 2;
+                if history[idx].role == "system" && history[idx].content.starts_with("Web search result") {
+                    history.remove(idx);
+                }
+            }
+        }
     }
 }
 

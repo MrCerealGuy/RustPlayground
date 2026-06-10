@@ -43,7 +43,8 @@ const PIPER_VOICE_URL: &str =
 const PIPER_VOICE_JSON_URL: &str =
     "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/kerstin/low/de_DE-kerstin-low.onnx.json";
 
-const SYSTEM_PROMPT: &str = "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden.";
+//const SYSTEM_PROMPT: &str = "Du bist ein hilfreicher Assistent, der ausschließlich in natürlich gesprochener Sprache antwortet. STRIKTES VERBOT von: Programmcode (egal welche Sprache), JavaScript, Python, HTML, CSS, Shell-Befehle, SQL, mathematische Formeln, LaTeX, Aufzählungen, Listen, nummerierte Schritte, Tabellen, Sternchen-Aufzählungen, Gedankenstriche, Sonderzeichen oder Formatierungen. Erkläre Konzepte in ganzen Sätzen ohne Beispiele in Code. Antworte als würdest du mit einem Freund sprechen – fließend, natürlich und direkt vorlesbar.";
+const SYSTEM_PROMPT: &str = "";
 
 //-----------------------------------------------------------------------------
 // Types
@@ -783,16 +784,22 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                     if let Some(msg) = parsed.message {
                         if let Some(content) = msg.content {
                             full_response.push_str(&content);
-                            tts_buffer.push_str(&content);
 
-                            if tts_buffer.len() >= 80
-                                && (tts_buffer.ends_with('.') || tts_buffer.ends_with('!') || tts_buffer.ends_with('?'))
-                            {
-                                let segment = std::mem::take(&mut tts_buffer);
-                                let _ = tts_tx.send(segment);
+                            // Skip TTS for markdown code blocks (```...```)
+                            let in_code = full_response.matches("```").count() % 2 == 1;
+                            if !in_code && !content.contains("```") {
+                                let cleaned = content.replace('`', "");
+                                tts_buffer.push_str(&cleaned);
+
+                                if tts_buffer.len() >= 80
+                                    && (tts_buffer.ends_with('.') || tts_buffer.ends_with('!') || tts_buffer.ends_with('?'))
+                                {
+                                    let segment = std::mem::take(&mut tts_buffer);
+                                    let _ = tts_tx.send(segment);
+                                }
                             }
 
-                            // Update visible text during streaming
+                            // Update visible text (always show everything including code)
                             {
                                 let mut s = state.lock().unwrap();
                                 if let Some(last) = s.messages.last_mut() {

@@ -786,7 +786,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
 // TUI rendering
 //-----------------------------------------------------------------------------
 
-fn ui(f: &mut ratatui::Frame, state: &AppState) {
+fn ui(f: &mut ratatui::Frame, state: &AppState, scroll_offset: &mut usize) {
     let size = f.size();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -825,7 +825,9 @@ fn ui(f: &mut ratatui::Frame, state: &AppState) {
         lines.push(Line::from(Span::raw(format!("Error: {}", err))));
     }
 
-    let scroll = lines.len().saturating_sub(inner.height as usize);
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    *scroll_offset = (*scroll_offset).min(max_scroll);
+    let scroll = max_scroll.saturating_sub(*scroll_offset);
     let chat = Paragraph::new(lines.clone())
         .scroll((scroll as u16, 0))
         .wrap(Wrap { trim: false });
@@ -880,11 +882,12 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let mut scroll_offset = 0usize;
+
     let res = loop {
-        // Render
         {
             let state_guard = state.lock().unwrap();
-            terminal.draw(|f| ui(f, &state_guard))?;
+            terminal.draw(|f| ui(f, &state_guard, &mut scroll_offset))?;
         }
 
         // Handle keyboard
@@ -895,6 +898,8 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
                         let _ = cmd_tx.send(UiCommand::Exit);
                         break Ok(());
                     }
+                    KeyCode::Up => scroll_offset = scroll_offset.saturating_add(1),
+                    KeyCode::Down => scroll_offset = scroll_offset.saturating_sub(1),
                     _ => {}
                 }
             }

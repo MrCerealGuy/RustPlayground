@@ -630,65 +630,6 @@ fn transcribe_via_whisper(wav_path: &str) -> Result<String, Box<dyn std::error::
 
 //-----------------------------------------------------------------------------
 
-fn compute_vu_levels(wav_path: &str) -> Vec<f32> {
-    let mut levels = Vec::new();
-    let mut reader = match hound::WavReader::open(wav_path) {
-        Ok(r) => r,
-        Err(_) => return levels,
-    };
-    let spec = reader.spec();
-    let frame_samples = (spec.sample_rate as usize / 20).max(1) * spec.channels as usize;
-    let mut chunk = Vec::with_capacity(frame_samples);
-
-    match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let divisor = match spec.bits_per_sample {
-                8 => i16::from(i8::MAX) as f32,
-                16 => i16::MAX as f32,
-                24 => 8388607.0f32,
-                32 => 2147483647.0f32,
-                _ => i16::MAX as f32,
-            };
-            for sample in reader.samples::<i16>() {
-                if let Ok(s) = sample {
-                    chunk.push(s as f32 / divisor);
-                    if chunk.len() >= frame_samples {
-                        let peak = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        levels.push(peak);
-                        chunk.clear();
-                    }
-                }
-            }
-        }
-        hound::SampleFormat::Float => {
-            for sample in reader.samples::<f32>() {
-                if let Ok(s) = sample {
-                    chunk.push(s);
-                    if chunk.len() >= frame_samples {
-                        let peak = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        levels.push(peak);
-                        chunk.clear();
-                    }
-                }
-            }
-        }
-    }
-
-    if !chunk.is_empty() {
-        let peak = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-        levels.push(peak);
-    }
-    levels
-}
-
-fn vu_meter_bar(level: f32, width: usize) -> String {
-    let filled = (level * width as f32).min(width as f32).round() as usize;
-    let empty = width - filled;
-    let bar: String = std::iter::repeat('█').take(filled).collect();
-    let space: String = std::iter::repeat('░').take(empty).collect();
-    format!("{}{}", bar, space)
-}
-
 fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
     if text.trim().is_empty() {
         return Ok(());
@@ -738,12 +679,6 @@ fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error:
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
-        let vu_levels = compute_vu_levels(&wav_path);
-        let vu_total = vu_levels.len();
-        let vu_start = std::time::Instant::now();
-        let mut last_display_vu = 0usize;
-        let mut vu_printed = false;
-
         loop {
             if let Ok(Some(_)) = play.try_wait() {
                 break;
@@ -751,32 +686,6 @@ fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error:
             if interrupted() {
                 let _ = play.kill();
                 break;
-            }
-
-            if vu_total > 0 {
-                let playback_frame = (vu_start.elapsed().as_millis() as usize) / 50;
-                let target_idx = playback_frame.min(vu_total.saturating_sub(1));
-
-                if target_idx > last_display_vu {
-                    last_display_vu = target_idx;
-                    if !vu_printed {
-                        vu_printed = true;
-                        println!();
-                        print!("\x1b[s");
-                    }
-                    let level = vu_levels[target_idx];
-                    let bar = vu_meter_bar(level, 24);
-                    let pct = (level * 100.0).min(100.0) as u8;
-                    let display: String = if pct > 70 {
-                        bar.red().to_string()
-                    } else if pct > 40 {
-                        bar.yellow().to_string()
-                    } else {
-                        bar.green().to_string()
-                    };
-                    print!("\x1b[u\x1b[2K🔊 {} {}%", display, pct);
-                    io::stdout().flush()?;
-                }
             }
 
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -960,7 +869,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut stream = response.bytes_stream();
 
-        println!("\n{}\n", "Assistant:".blue());
+        println!("\n{}\n", "AI:".blue());
 
         let mut full_response = String::new();
 

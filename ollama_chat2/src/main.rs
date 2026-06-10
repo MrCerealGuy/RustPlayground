@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +86,7 @@ struct AppState {
     status_text: String,
     vad_level: f32,
     vu_level: f32,
+    transcription_progress: u16,
     error: Option<String>,
 }
 
@@ -97,6 +98,7 @@ impl AppState {
             status_text: "Listening...".into(),
             vad_level: 0.0,
             vu_level: 0.0,
+            transcription_progress: 0,
             error: None,
         }
     }
@@ -324,19 +326,55 @@ fn save_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn transcribe_via_whisper(wav_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn transcribe_via_whisper(wav_path: &str, state: Arc<Mutex<AppState>>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let whisper_path = cwd.join(WHISPER_EXE_PATH);
     let model_path = cwd.join(WHISPER_MODEL_PATH);
-    let output = Command::new(&whisper_path)
-        .args(["-m", &model_path.to_string_lossy(), "-f", wav_path, "-nt", "-np", "-l", "de"])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("whisper.cpp failed: {}", stderr).into());
+    let mut child = Command::new(&whisper_path)
+        .args(["-m", &model_path.to_string_lossy(), "-f", wav_path, "-nt", "-pp", "-l", "de"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Read stdout for transcription text
+    let stdout = child.stdout.take().unwrap();
+    let read_stdout = std::thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        let mut lines = Vec::new();
+        for line in reader.lines() {
+            if let Ok(line) = line { lines.push(line); }
+        }
+        lines
+    });
+
+    // Read stderr for progress (whisper.cpp prints progress to stderr with -pp flag)
+    let stderr = child.stderr.take().unwrap();
+    let progress_state = Arc::clone(&state);
+    let read_stderr = std::thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Some(pct) = line.split("progress =").nth(1)
+                    .and_then(|s| s.trim().trim_end_matches('%').parse::<u16>().ok())
+                    .map(|v| v.min(100))
+                {
+                    if let Ok(mut s) = progress_state.lock() {
+                        s.transcription_progress = pct;
+                    }
+                }
+            }
+        }
+    });
+
+    let status = child.wait()?;
+    let trans_lines = read_stdout.join().unwrap();
+    read_stderr.join().unwrap();
+
+    if !status.success() {
+        return Err(format!("whisper.cpp failed with exit code {:?}", status.code()).into());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let text = stdout.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" ").trim().to_string();
+
+    let text = trans_lines.iter().map(|s| s.as_str()).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" ").trim().to_string();
     Ok(text)
 }
 
@@ -633,6 +671,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             let mut s = state.lock().unwrap();
             s.phase = Phase::Transcribing;
             s.status_text = "Transcribing...".into();
+            s.transcription_progress = 0;
         }
 
         let wav_path = std::env::temp_dir().join("ollama_chat_input.wav");
@@ -645,8 +684,14 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             continue;
         }
 
-        let input = match transcribe_via_whisper(wav_str) {
-            Ok(t) => t,
+        let input = match transcribe_via_whisper(wav_str, Arc::clone(&state)) {
+            Ok(t) => {
+                {
+                    let mut s = state.lock().unwrap();
+                    s.transcription_progress = 100;
+                }
+                t
+            }
             Err(e) => {
                 let mut s = state.lock().unwrap();
                 s.phase = Phase::Listening;
@@ -805,26 +850,50 @@ fn ui(f: &mut ratatui::Frame, state: &AppState, scroll_offset: &mut usize) {
     let block = Block::default().borders(Borders::ALL).title(" Conversation ");
     f.render_widget(block, chat_rect);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in &state.messages {
-        let prefix = if entry.role == "user" { "You: " } else { "AI: " };
-        let mut first = true;
-        for line_text in entry.content.lines() {
-            if line_text.is_empty() {
-                lines.push(Line::from(Span::raw("")));
-            } else if first {
-                lines.push(Line::from(Span::raw(format!("{}{}", prefix, line_text))));
-                first = false;
-            } else {
-                lines.push(Line::from(Span::raw(line_text.to_string())));
-            }
+// Pre-wrap long lines at inner.width to keep lines.len() == visual lines
+let max_width = inner.width.saturating_sub(2) as usize;
+let mut lines: Vec<Line> = Vec::new();
+for entry in &state.messages {
+    let prefix = if entry.role == "user" { "You: " } else { "AI: " };
+    let mut first = true;
+    for line_text in entry.content.lines() {
+        if line_text.is_empty() {
+            lines.push(Line::from(Span::raw("")));
+            continue;
         }
-        lines.push(Line::from(Span::raw("")));
+        let text = if first { format!("{}{}", prefix, line_text) } else { line_text.to_string() };
+        first = false;
+        if max_width > 0 {
+            let mut start = 0;
+            let len = text.len();
+            while start < len {
+                let end = std::cmp::min(start + max_width, len);
+                // Try to break at a space if not at the end
+                let break_at = if end < len {
+                    if let Some(space) = text[start..end].rfind(' ') {
+                        start + space + 1
+                    } else {
+                        end
+                    }
+                } else {
+                    end
+                };
+                lines.push(Line::from(Span::raw(text[start..break_at].to_string())));
+                start = break_at;
+            }
+        } else {
+            lines.push(Line::from(Span::raw(text)));
+        }
     }
+    lines.push(Line::from(Span::raw("")));
+}
     if let Some(ref err) = state.error {
         lines.push(Line::from(Span::raw(format!("Error: {}", err))));
     }
 
+    if state.phase == Phase::Transcribing || state.phase == Phase::Thinking || state.phase == Phase::Speaking {
+        *scroll_offset = 0;
+    }
     let max_scroll = lines.len().saturating_sub(inner.height as usize);
     *scroll_offset = (*scroll_offset).min(max_scroll);
     let scroll = max_scroll.saturating_sub(*scroll_offset);
@@ -868,6 +937,8 @@ fn ui(f: &mut ratatui::Frame, state: &AppState, scroll_offset: &mut usize) {
         .percent((state.vad_level * 100.0).min(100.0) as u16)
         .label(vad_label);
     f.render_widget(vad_gauge, status_chunks[2]);
+
+    // Phase text shows Transcribing status in status bar
 }
 
 //-----------------------------------------------------------------------------

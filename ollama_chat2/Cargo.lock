@@ -1147,6 +1147,7 @@ dependencies = [
  "ollama-rs",
  "owo-colors",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

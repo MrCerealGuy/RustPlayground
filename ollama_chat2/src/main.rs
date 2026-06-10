@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::Terminal;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,10 @@ struct AppState {
     vu_level: f32,
     transcription_progress: u16,
     error: Option<String>,
+    search_in_progress: bool,
+    search_query: String,
+    search_result: String,
+    search_show_until: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -101,6 +105,10 @@ impl AppState {
             vu_level: 0.0,
             transcription_progress: 0,
             error: None,
+            search_in_progress: false,
+            search_query: String::new(),
+            search_result: String::new(),
+            search_show_until: None,
         }
     }
 }
@@ -392,6 +400,11 @@ fn is_meaningful_speech(text: &str) -> bool {
 //-----------------------------------------------------------------------------
 
 fn search_web(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
+    // WEBFETCH: prefix → fetch and extract text from a URL
+    if let Some(url) = query.strip_prefix("WEBFETCH:") {
+        return fetch_url_text(url, client, rt);
+    }
+
     let lower = query.to_lowercase();
 
     // Weather query → use Open-Meteo API (free, no key)
@@ -467,6 +480,46 @@ fn search_web(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> Str
     } else {
         parts.join("\n")
     }
+}
+
+fn fetch_url_text(url: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
+    let result = rt.block_on(async { client.get(url).send().await });
+    let body = match result {
+        Ok(resp) => match rt.block_on(async { resp.text().await }) {
+            Ok(t) => t,
+            Err(e) => return format!("Fehler beim Abrufen der Seite: {}", e),
+        },
+        Err(e) => return format!("Fehler beim Abrufen der Seite: {}", e),
+    };
+
+    let text = strip_html(&body);
+    let max_len = 8000;
+    if text.len() > max_len {
+        format!("{}\n\n[Text gekürzt auf {} Zeichen]", &text[..max_len], max_len)
+    } else {
+        text
+    }
+}
+
+fn strip_html(html: &str) -> String {
+    let re = regex::Regex::new(r"(?i)<script[^>]*>[\s\S]*?</script>").unwrap();
+    let s = re.replace_all(html, " ");
+    let re = regex::Regex::new(r"(?i)<style[^>]*>[\s\S]*?</style>").unwrap();
+    let s = re.replace_all(&s, " ");
+    let re = regex::Regex::new(r"<[^>]+>").unwrap();
+    let s = re.replace_all(&s, " ");
+    let s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&nbsp;", " ")
+        .replace("&auml;", "ä").replace("&ouml;", "ö").replace("&uuml;", "ü")
+        .replace("&Auml;", "Ä").replace("&Ouml;", "Ö").replace("&Uuml;", "Ü")
+        .replace("&szlig;", "ß");
+    let re = regex::Regex::new(r"\s+").unwrap();
+    let s = re.replace_all(&s, " ");
+    s.trim().to_string()
+}
+
+fn is_likely_domain(s: &str) -> bool {
+    s.contains('.') && !s.contains(' ') && s.len() >= 4
 }
 
 fn search_weather(location: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
@@ -600,6 +653,36 @@ fn detect_search_intent(text: &str) -> Option<String> {
         }
     }
 
+    // URL + summarize/fetch pattern: "fass ... auf <domain>" / "zusammenfassung ... <domain>"
+    let wants_fetch = lower.contains("zusammenfass") || lower.contains("neuigkeit")
+        || lower.contains("nachricht") || lower.contains("aktuell")
+        || lower.contains("recherchier") || lower.contains("artikel");
+    let has_url_prefix = [" auf ", " von ", " von der "];
+    if wants_fetch {
+        for prefix in &has_url_prefix {
+            if let Some(idx) = lower.find(prefix) {
+                let after = text[idx + prefix.len()..].trim().trim_end_matches('?').trim();
+                let domain = after.split_whitespace().next().unwrap_or("");
+                if is_likely_domain(domain) {
+                    let scheme = if domain.starts_with("http") { "" } else { "https://" };
+                    return Some(format!("WEBFETCH:{}{}", scheme, domain));
+                }
+            }
+        }
+    }
+
+    // Direct URL mention without a summarize keyword
+    for prefix in &[" auf ", " von ", " von der "] {
+        if let Some(idx) = lower.find(prefix) {
+            let after = text[idx + prefix.len()..].trim().trim_end_matches('?').trim();
+            let domain = after.split_whitespace().next().unwrap_or("");
+            if is_likely_domain(domain) {
+                let scheme = if domain.starts_with("http") { "" } else { "https://" };
+                return Some(format!("WEBFETCH:{}{}", scheme, domain));
+            }
+        }
+    }
+
     // Weather questions with location extraction (first "in" match)
     if lower.contains("wetter") {
         if let Some(idx) = lower.find(" in ") {
@@ -611,7 +694,7 @@ fn detect_search_intent(text: &str) -> Option<String> {
         return Some(format!("Wetter {}", text.trim_end_matches('?')));
     }
 
-    // Questions about current events, news
+    // Questions about current events, news (fallback – search via DuckDuckGo)
     if lower.contains("nachricht") || lower.contains("aktuell") || lower.contains("neuigkeit") {
         return Some(text.trim_end_matches('?').to_string());
     }
@@ -960,11 +1043,21 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         if let Some(ref query) = search_query {
             {
                 let mut s = state.lock().unwrap();
+                s.search_in_progress = true;
+                s.search_show_until = None;
+                s.search_query = query.clone();
                 let disp = if query.len() > 40 { format!("{}...", &query[..40]) } else { query.clone() };
                 s.status_text = format!("Web search: {}", disp);
             }
 
             let result = search_web(query, &client, &rt);
+
+            {
+                let mut s = state.lock().unwrap();
+                s.search_in_progress = false;
+                s.search_result = result.clone();
+                s.search_show_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            }
 
             // Inject search result as context message
             history.push(Message {
@@ -1215,6 +1308,43 @@ for entry in &state.messages {
     f.render_widget(vad_gauge, status_chunks[2]);
 
     // Phase text shows Transcribing status in status bar
+
+    // Search dialog overlay
+    let show_search = state.search_in_progress
+        || state.search_show_until.map(|t| t > std::time::Instant::now()).unwrap_or(false);
+    if show_search {
+        let area = centered_rect(70, 50, size);
+        let status = if state.search_in_progress { " Web Search " } else { " Search Complete " };
+        let display_text = if state.search_in_progress {
+            format!("🔍 {}", state.search_query)
+        } else {
+            format!("🔍 {}\n\n{}", state.search_query, state.search_result)
+        };
+        let dialog = Paragraph::new(display_text)
+            .block(Block::default().borders(Borders::ALL).title(status))
+            .wrap(Wrap { trim: false });
+        f.render_widget(Clear, area);
+        f.render_widget(dialog, area);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((r.height * (100 - percent_y)) / 200),
+            Constraint::Length((r.height * percent_y) / 100),
+            Constraint::Length((r.height * (100 - percent_y)) / 200),
+        ])
+        .split(r)[1];
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((r.width * (100 - percent_x)) / 200),
+            Constraint::Length((r.width * percent_x) / 100),
+            Constraint::Length((r.width * (100 - percent_x)) / 200),
+        ])
+        .split(popup)[1]
 }
 
 //-----------------------------------------------------------------------------

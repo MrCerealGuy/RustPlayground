@@ -399,6 +399,16 @@ fn is_meaningful_speech(text: &str) -> bool {
 // Web search
 //-----------------------------------------------------------------------------
 
+fn clean_location(s: &str) -> &str {
+    let s = s.trim();
+    for prefix in &["in ", "für ", "bei ", "um ", "im ", "am "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    s
+}
+
 fn search_web(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
     // WEBFETCH: prefix → fetch and extract text from a URL
     if let Some(url) = query.strip_prefix("WEBFETCH:") {
@@ -411,75 +421,132 @@ fn search_web(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> Str
     if lower.starts_with("wetter ") || lower.starts_with("weather ") {
         let location = query.splitn(2, ' ').nth(1).unwrap_or("").trim();
         if !location.is_empty() {
-            return search_weather(location, client, rt);
+            return search_weather(clean_location(location), client, rt);
         }
     }
 
-    // General query → DuckDuckGo Instant Answer API
+    // General query → DuckDuckGo Lite scrape (echte Web-Ergebnisse)
+    search_duckduckgo_lite(query, client, rt)
+}
+
+fn decode_duckduckgo_url(redirect: &str) -> String {
+    // URLs: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...
+    if let Some(query) = redirect.split('?').nth(1) {
+        for param in query.split('&') {
+            if let Some(value) = param.strip_prefix("uddg=") {
+                return urlencoding::decode(value).unwrap_or_default().to_string();
+            }
+        }
+    }
+    redirect.to_string()
+}
+
+fn search_duckduckgo_lite(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
     let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        encoded
-    );
+    let url = format!("https://lite.duckduckgo.com/lite/?q={}&kl=de-de", encoded);
 
     let result = rt.block_on(async { client.get(&url).send().await });
     let body = match result {
         Ok(resp) => match rt.block_on(async { resp.text().await }) {
             Ok(t) => t,
-            Err(e) => return format!("Fehler beim Lesen der Suchergebnisse: {}", e),
+            Err(e) => return format!("Fehler beim Lesen: {}", e),
         },
-        Err(e) => return format!("Fehler bei der Suchanfrage: {}", e),
-    };
-
-    let json: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => return format!("Keine Suchergebnisse für '{}' gefunden.", query),
+        Err(e) => return format!("Fehler bei der Anfrage: {}", e),
     };
 
     let mut parts: Vec<String> = Vec::new();
 
-    if let Some(answer) = json["Answer"].as_str() {
-        if !answer.is_empty() {
-            parts.push(format!("Antwort: {}", answer));
+    // Zero-click info (knowledge panel am Seitenanfang)
+    let zc_re = regex::Regex::new(r#"(?s)Zero-click info: <a rel="nofollow" href="([^"]+)">([^<]+)</a>\s*</td>\s*</tr>\s*<tr>\s*<td>\s*(.*?)</td>"#).unwrap();
+    if let Some(caps) = zc_re.captures(&body) {
+        let title = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let desc = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+        let desc_clean = strip_html(&desc);
+        if !desc_clean.is_empty() {
+            parts.push(format!("Info: {} – {}", title, desc_clean));
         }
     }
 
-    if let Some(abstract_text) = json["Abstract"].as_str() {
-        if !abstract_text.is_empty() {
-            parts.push(format!("Zusammenfassung: {}", abstract_text));
-            if let Some(source) = json["AbstractSource"].as_str() {
-                if !source.is_empty() {
-                    parts.push(format!("Quelle: {}", source));
-                }
-            }
-        }
-    }
+    // Alle Ergebnis-Titel und Ziel-URLs
+    let title_re = regex::Regex::new(
+        r#"<a rel="nofollow" href="([^"]*)" class='result-link'>([^<]*)</a>"#
+    ).unwrap();
+    let titles: Vec<(String, String)> = title_re.captures_iter(&body)
+        .map(|c| {
+            let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = c.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+            let real_url = decode_duckduckgo_url(href);
+            (title, real_url)
+        })
+        .collect();
 
-    if let Some(topics) = json["RelatedTopics"].as_array() {
-        let mut count = 0;
-        for topic in topics {
-            if count >= 5 { break; }
-            if let Some(text) = topic["Text"].as_str() {
-                parts.push(format!("- {}", text));
-                count += 1;
-            }
-            if let Some(subtopics) = topic["Topics"].as_array() {
-                for sub in subtopics {
-                    if count >= 5 { break; }
-                    if let Some(text) = sub["Text"].as_str() {
-                        parts.push(format!("- {}", text));
-                        count += 1;
-                    }
-                }
-            }
+    // Alle Snippets
+    let snippet_re = regex::Regex::new(
+        r#"<td class='result-snippet'>\s*(.*?)\s*</td>"#
+    ).unwrap();
+    let snippets: Vec<String> = snippet_re.captures_iter(&body)
+        .map(|c| {
+            let s = c.get(1).map(|m| m.as_str()).unwrap_or("");
+            strip_html(s)
+        })
+        .collect();
+
+    // Alle Anzeige-URLs
+    let url_re = regex::Regex::new(
+        r#"<span class='link-text'>([^<]*)</span>"#
+    ).unwrap();
+    let display_urls: Vec<String> = url_re.captures_iter(&body)
+        .map(|c| c.get(1).map(|m| m.as_str()).unwrap_or("").to_string())
+        .collect();
+
+    let count = titles.len().min(snippets.len()).min(display_urls.len());
+    for i in 0..count {
+        parts.push(format!("{}. {} – {}", i + 1, titles[i].0, display_urls[i]));
+        if !snippets[i].is_empty() {
+            parts.push(format!("   {}", snippets[i]));
         }
     }
 
     if parts.is_empty() {
-        format!("Keine Suchergebnisse für '{}' gefunden.", query)
+        search_wikipedia(query, client, rt)
     } else {
         parts.join("\n")
     }
+}
+
+fn search_wikipedia(query: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
+    // Try German Wikipedia first, then English
+    for lang in &["de", "en"] {
+        let encoded = urlencoding::encode(query);
+        let url = format!("https://{}.wikipedia.org/api/rest_v1/page/summary/{}", lang, encoded);
+        let result = rt.block_on(async { client.get(&url).send().await });
+        let body = match result {
+            Ok(resp) => match rt.block_on(async { resp.text().await }) {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if json.get("type").and_then(|t| t.as_str()) == Some("disambiguation") {
+            continue; // skip disambiguation pages
+        }
+        if let Some(extract) = json["extract"].as_str() {
+            if !extract.is_empty() {
+                let title = json["title"].as_str().unwrap_or(query);
+                let page_url = json["content_urls"]["desktop"]["page"].as_str().unwrap_or("");
+                let mut result = format!("Wikipedia-Artikel '{}':\n{}", title, extract);
+                if !page_url.is_empty() {
+                    result.push_str(&format!("\nQuelle: {}", page_url));
+                }
+                return result;
+            }
+        }
+    }
+    format!("Keine Suchergebnisse für '{}' gefunden.", query)
 }
 
 fn fetch_url_text(url: &str, client: &Client, rt: &tokio::runtime::Runtime) -> String {
@@ -644,22 +711,44 @@ fn weather_code_desc(code: i64) -> &'static str {
 
 fn detect_search_intent(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
+    let text_clean = text.trim_end_matches('?').trim();
 
-    // Direct "such nach" / "suche nach" commands
+    // 1. "Suche im Internet nach X" / "Suche im Web nach X"
+    if lower.contains("suche") && (lower.contains("internet") || lower.contains("web")) {
+        if let Some(idx) = lower.rfind(" nach ") {
+            let q = text[idx + 6..].trim_end_matches('?').trim().to_string();
+            if !q.is_empty() { return Some(q); }
+        }
+        return Some(text_clean.to_string());
+    }
+
+    // 2. "Recherchiere zu X" / "Führe eine Recherche zu X durch"
+    if lower.contains("recherch") {
+        for kw in &["zum thema ", "zu ", "über ", "nach "] {
+            if let Some(idx) = lower.rfind(kw) {
+                let q = text[idx + kw.len()..].trim_end_matches('?').trim().to_string();
+                if !q.is_empty() && q.len() < text.len() / 2 { return Some(q); }
+            }
+        }
+        return Some(text_clean.to_string());
+    }
+
+    // 3. Direct "such nach" / "suche nach" / "such mal nach" / "google" commands
     for keyword in &["such nach ", "suche nach ", "such mal nach ", "google "] {
         if let Some(idx) = lower.find(keyword) {
-            let query = text[idx + keyword.len()..].trim().to_string();
-            if !query.is_empty() { return Some(query); }
+            let q = text[idx + keyword.len()..].trim().to_string();
+            if !q.is_empty() { return Some(q); }
         }
     }
 
-    // URL + summarize/fetch pattern: "fass ... auf <domain>" / "zusammenfassung ... <domain>"
+    // 4. URL + summarize/fetch pattern
     let wants_fetch = lower.contains("zusammenfass") || lower.contains("neuigkeit")
         || lower.contains("nachricht") || lower.contains("aktuell")
-        || lower.contains("recherchier") || lower.contains("artikel");
-    let has_url_prefix = [" auf ", " von ", " von der "];
+        || lower.contains("artikel") || lower.contains("seite")
+        || lower.contains("recherch");
+    let url_prefixes = [" auf ", " von ", " von der ", " über ", " zu "];
     if wants_fetch {
-        for prefix in &has_url_prefix {
+        for prefix in &url_prefixes {
             if let Some(idx) = lower.find(prefix) {
                 let after = text[idx + prefix.len()..].trim().trim_end_matches('?').trim();
                 let domain = after.split_whitespace().next().unwrap_or("");
@@ -671,8 +760,8 @@ fn detect_search_intent(text: &str) -> Option<String> {
         }
     }
 
-    // Direct URL mention without a summarize keyword
-    for prefix in &[" auf ", " von ", " von der "] {
+    // 5. Direct URL mention (any prefix)
+    for prefix in &url_prefixes {
         if let Some(idx) = lower.find(prefix) {
             let after = text[idx + prefix.len()..].trim().trim_end_matches('?').trim();
             let domain = after.split_whitespace().next().unwrap_or("");
@@ -683,7 +772,7 @@ fn detect_search_intent(text: &str) -> Option<String> {
         }
     }
 
-    // Weather questions with location extraction (first "in" match)
+    // 6. Weather questions
     if lower.contains("wetter") {
         if let Some(idx) = lower.find(" in ") {
             let location = text[idx + 4..].trim().trim_end_matches('?').trim();
@@ -691,17 +780,20 @@ fn detect_search_intent(text: &str) -> Option<String> {
                 return Some(format!("Wetter {}", location));
             }
         }
-        return Some(format!("Wetter {}", text.trim_end_matches('?')));
+        return Some(format!("Wetter {}", text_clean));
     }
 
-    // Questions about current events, news (fallback – search via DuckDuckGo)
-    if lower.contains("nachricht") || lower.contains("aktuell") || lower.contains("neuigkeit") {
-        return Some(text.trim_end_matches('?').to_string());
-    }
-
-    // Explicit "recherchiere" / "suche" / "googel"
-    if lower.contains("recherchier") || lower.contains("googel") || lower == "suche" {
-        return Some(text.trim_end_matches('?').to_string());
+    // 7. News / research fallback – extract a meaningful query
+    if lower.contains("nachricht") || lower.contains("aktuell") || lower.contains("neuigkeit")
+        || lower.contains("recherch") || lower.contains("googel")
+    {
+        for kw in &["über ", "zu ", "nach ", "zum thema "] {
+            if let Some(idx) = lower.rfind(kw) {
+                let q = text[idx + kw.len()..].trim_end_matches('?').trim().to_string();
+                if !q.is_empty() && q.len() < text.len() / 2 { return Some(q); }
+            }
+        }
+        return Some(text_clean.to_string());
     }
 
     None

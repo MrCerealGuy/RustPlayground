@@ -1,52 +1,28 @@
-// -----------------------------------------------------------------------------
-// ollama_chat2 - Your personal AI chat assistant.
-//
-// by Andreas Zahnleiter <a.zahnleiter@gmx.de>
-// -----------------------------------------------------------------------------
-// 2026-05-17 - az - created
-// 2026-05-18 - az - added ollama installation process
-// 2026-05-19 - az - added colored text and unicode symbols
-// 2026-05-20 - az - check for Windows 11 
-// 2026-06-06 - az - replaced stdin input with speech-to-text (whisper.cpp)
-// -----------------------------------------------------------------------------
-
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::Terminal;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use owo_colors::OwoColorize;
 
 //-----------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-//-----------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct OllamaChunk {
-    message: Option<OllamaMessage>,
-    done: Option<bool>,
-}
-
-//-----------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct OllamaMessage {
-    content: Option<String>,
-}
-
+// Constants
 //-----------------------------------------------------------------------------
 
 const WHISPER_MODEL_URL: &str =
@@ -67,92 +43,114 @@ const PIPER_VOICE_URL: &str =
 const PIPER_VOICE_JSON_URL: &str =
     "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/ramona/low/de_DE-ramona-low.onnx.json";
 
+const SYSTEM_PROMPT: &str = "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden.";
+
+//-----------------------------------------------------------------------------
+// Types
+//-----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChunk {
+    message: Option<OllamaMessage>,
+    done: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaMessage {
+    content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatEntry {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Phase {
+    Ready,
+    Listening,
+    Transcribing,
+    Thinking,
+    Speaking,
+}
+
+struct AppState {
+    messages: Vec<ChatEntry>,
+    phase: Phase,
+    status_text: String,
+    vad_level: f32,
+    vu_level: f32,
+    error: Option<String>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            phase: Phase::Ready,
+            status_text: "Press ENTER to start speaking".into(),
+            vad_level: 0.0,
+            vu_level: 0.0,
+            error: None,
+        }
+    }
+}
+
+enum UiCommand {
+    StartRecording,
+    Exit,
+}
+
+//-----------------------------------------------------------------------------
+// System checks
 //-----------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 fn is_windows_11() -> bool {
     use winreg::enums::*;
     use winreg::RegKey;
-
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-
-    let current_version = hklm
-        .open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
-
-    if let Ok(key) = current_version {
-        let build: Result<String, _> = key.get_value("CurrentBuild");
-
-        if let Ok(build) = build {
+    if let Ok(key) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion") {
+        if let Ok(build) = key.get_value::<String, _>("CurrentBuild") {
             if let Ok(build_number) = build.parse::<u32>() {
                 return build_number >= 22000;
             }
         }
     }
-
-    return false;
+    false
 }
-
-//-----------------------------------------------------------------------------
 
 fn ollama_is_installed() -> bool {
-    let output = Command::new("ollama")
-        .arg("--version")
-        .output();
-
-    match output {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
+    Command::new("ollama").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false)
 }
-
-//-----------------------------------------------------------------------------
 
 fn install_ollama() -> bool {
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "irm https://ollama.com/install.ps1 | iex",
-        ])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => true,
-        _ => false,
-    }
+    Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+               "irm https://ollama.com/install.ps1 | iex"])
+        .status().map(|s| s.success()).unwrap_or(false)
 }
-
-//-----------------------------------------------------------------------------
 
 fn phi4_is_installed() -> bool {
-    let output = Command::new("ollama")
-        .args(["list"])
-        .output();
+    Command::new("ollama").args(["list"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("phi4")).unwrap_or(false)
+}
 
-    match output {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains("phi4")
-        }
-        _ => false,
-    }
+fn install_phi4() -> bool {
+    Command::new("ollama").args(["pull", "phi4"])
+        .status().map(|s| s.success()).unwrap_or(false)
 }
 
 //-----------------------------------------------------------------------------
-
-fn install_phi4() -> bool {
-    let status = Command::new("ollama")
-        .args(["pull", "phi4"])
-        .status();
-
-    match status {
-        Ok(s) => s.success(),
-        Err(_) => false,
-    }
-}
-
+// Downloads
 //-----------------------------------------------------------------------------
 
 async fn download_whisper_model(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -161,19 +159,13 @@ async fn download_whisper_model(client: &Client) -> Result<(), Box<dyn std::erro
         println!("✅ Whisper model '{}' found.", WHISPER_MODEL_PATH);
         return Ok(());
     }
-
-    // Remove partial download if present
     let _ = std::fs::remove_file(model_path);
-
     println!("{} Downloading Whisper model (~1.5 GB)...", "Model missing.".red());
     println!("   {}", WHISPER_MODEL_URL);
-
     let response = client.get(WHISPER_MODEL_URL).send().await?;
     let total = response.content_length().unwrap_or(0);
-
     let mut file = std::fs::File::create(model_path)?;
     let mut downloaded: u64 = 0;
-
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -187,12 +179,9 @@ async fn download_whisper_model(client: &Client) -> Result<(), Box<dyn std::erro
         }
         io::stdout().flush()?;
     }
-
     println!("\n✅ Whisper model downloaded.");
     Ok(())
 }
-
-//-----------------------------------------------------------------------------
 
 async fn download_whisper_binary(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = Path::new(WHISPER_EXE_PATH);
@@ -200,36 +189,24 @@ async fn download_whisper_binary(client: &Client) -> Result<(), Box<dyn std::err
         println!("✅ Whisper binary found.");
         return Ok(());
     }
-
     println!("{} Downloading whisper.cpp binary...", "Binary missing.".red());
     println!("   {}", WHISPER_EXE_URL);
-
     let response = client.get(WHISPER_EXE_URL).send().await?;
     let bytes = response.bytes().await?;
     std::fs::write(WHISPER_ZIP_PATH, &bytes)?;
-
     println!("{} Extracting...", "Extracting zip.".yellow());
-
     let out_dir = "whisper_extracted";
     let extract = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", WHISPER_ZIP_PATH, out_dir),
-        ])
+        .args(["-NoProfile", "-Command",
+               &format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", WHISPER_ZIP_PATH, out_dir)])
         .output()?;
-
     if !extract.status.success() {
         let err = String::from_utf8_lossy(&extract.stderr);
         let _ = std::fs::remove_file(WHISPER_ZIP_PATH);
         return Err(format!("Extraction failed: {}", err).into());
     }
-
-    // In v1.8.6, binaries are in a Release/ subfolder with whisper-cli.exe
     let release_dir = Path::new(out_dir).join("Release");
     let source_exe = release_dir.join("whisper-cli.exe");
-    let source_dlls = ["whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"];
-
     if source_exe.exists() {
         std::fs::rename(&source_exe, WHISPER_EXE_PATH)?;
     } else {
@@ -237,98 +214,69 @@ async fn download_whisper_binary(client: &Client) -> Result<(), Box<dyn std::err
         let _ = std::fs::remove_dir_all(out_dir);
         return Err("whisper-cli.exe not found in extracted archive.".into());
     }
-
-    // Copy needed DLLs alongside the exe
-    for dll in &source_dlls {
+    for dll in &["whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"] {
         let src = release_dir.join(dll);
         if src.exists() {
             let _ = std::fs::copy(&src, dll);
         }
     }
-
-    // Cleanup
     let _ = std::fs::remove_file(WHISPER_ZIP_PATH);
     let _ = std::fs::remove_dir_all(out_dir);
-
     println!("✅ Whisper binary ready.");
     Ok(())
 }
 
-//-----------------------------------------------------------------------------
-
 async fn download_piper_binary(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let piper_dir = Path::new(PIPER_DIR);
     let exe_path = piper_dir.join("piper.exe");
-
     if exe_path.exists() {
         println!("✅ Piper binary found.");
         return Ok(());
     }
-
     println!("{} Downloading Piper TTS binary (~22 MB)...", "Binary missing.".red());
     println!("   {}", PIPER_EXE_URL);
-
     let response = client.get(PIPER_EXE_URL).send().await?;
     let bytes = response.bytes().await?;
     std::fs::write(PIPER_ZIP_PATH, &bytes)?;
-
     println!("{} Extracting...", "Extracting zip.".yellow());
-
     let out_dir = "piper_extracted";
     let extract = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", PIPER_ZIP_PATH, out_dir),
-        ])
+        .args(["-NoProfile", "-Command",
+               &format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", PIPER_ZIP_PATH, out_dir)])
         .output()?;
-
     if !extract.status.success() {
         let err = String::from_utf8_lossy(&extract.stderr);
         let _ = std::fs::remove_file(PIPER_ZIP_PATH);
         return Err(format!("Extraction failed: {}", err).into());
     }
-
     let extracted_piper = Path::new(out_dir).join("piper");
-
     if extracted_piper.exists() {
-        if piper_dir.exists() {
-            std::fs::remove_dir_all(piper_dir)?;
-        }
+        if piper_dir.exists() { std::fs::remove_dir_all(piper_dir)?; }
         std::fs::rename(&extracted_piper, PIPER_DIR)?;
     } else {
         let _ = std::fs::remove_file(PIPER_ZIP_PATH);
         let _ = std::fs::remove_dir_all(out_dir);
         return Err("piper/ directory not found in extracted archive.".into());
     }
-
     let _ = std::fs::remove_file(PIPER_ZIP_PATH);
     let _ = std::fs::remove_dir_all(out_dir);
-
     println!("✅ Piper binary ready.");
     Ok(())
 }
 
-//-----------------------------------------------------------------------------
-
 async fn download_piper_voice(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let piper_dir = Path::new(PIPER_DIR);
     let voice_path = piper_dir.join("de_DE-ramona-low.onnx");
-
     if voice_path.exists() {
         println!("✅ Piper German female voice model found.");
         return Ok(());
     }
-
     std::fs::create_dir_all(piper_dir)?;
-
     println!("{} Downloading German voice model (~63 MB)...", "Voice model missing.".red());
     println!("   {}", PIPER_VOICE_URL);
-
     let response = client.get(PIPER_VOICE_URL).send().await?;
     let bytes = response.bytes().await?;
     std::fs::write(&voice_path, &bytes)?;
-
     let json_path = piper_dir.join("de_DE-ramona-low.onnx.json");
     if !json_path.exists() {
         println!("   Downloading voice config...");
@@ -338,39 +286,77 @@ async fn download_piper_voice(client: &Client) -> Result<(), Box<dyn std::error:
             }
         }
     }
-
     println!("✅ German voice model downloaded.");
     Ok(())
 }
 
 //-----------------------------------------------------------------------------
+// Audio helpers
+//-----------------------------------------------------------------------------
 
-fn record_audio_push_to_talk() -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    println!("{}", "\n🎤 Listening... (speak to record)".yellow());
-    io::stdout().flush()?;
+fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate { return input.to_vec(); }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let output_len = (input.len() as f64 * ratio).ceil() as usize;
+    let mut output = Vec::with_capacity(output_len);
+    for i in 0..output_len {
+        let src_idx = (i as f64 / ratio) as usize;
+        let src_idx = src_idx.min(input.len().saturating_sub(1));
+        let frac = (i as f64 / ratio) - src_idx as f64;
+        let next_idx = (src_idx + 1).min(input.len().saturating_sub(1));
+        let sample = input[src_idx] * (1.0 - frac as f32) + input[next_idx] * frac as f32;
+        output.push(sample);
+    }
+    output
+}
 
-    record_audio_inner(None)
+fn save_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    let amplitude = i16::MAX as f32;
+    for &sample in samples {
+        writer.write_sample((sample * amplitude) as i16)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+fn transcribe_via_whisper(wav_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let whisper_path = cwd.join(WHISPER_EXE_PATH);
+    let model_path = cwd.join(WHISPER_MODEL_PATH);
+    let output = Command::new(&whisper_path)
+        .args(["-m", &model_path.to_string_lossy(), "-f", wav_path, "-nt", "-np", "-l", "de"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("whisper.cpp failed: {}", stderr).into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = stdout.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" ").trim().to_string();
+    Ok(text)
+}
+
+fn is_meaningful_speech(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() { return false; }
+    let lower = t.to_lowercase();
+    !(lower.contains("[blank_audio]") || lower.contains("[music") || lower.contains("[laughter]")
+        || lower.contains("[sound") || lower.contains("[noise]"))
 }
 
 //-----------------------------------------------------------------------------
-
-fn record_audio_interrupt(
-    cancel: Arc<AtomicBool>,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    record_audio_inner(Some(cancel))
-}
-
+// Audio recording with VAD
 //-----------------------------------------------------------------------------
 
-fn record_audio_inner(
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-
+fn record_audio_inner(cancel: Option<Arc<AtomicBool>>, state: Arc<Mutex<AppState>>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or("No input device found")?;
-
+    let device = host.default_input_device().ok_or("No input device found")?;
     let supported_config = device.default_input_config()?;
     let sample_format = supported_config.sample_format();
     let sample_rate = supported_config.sample_rate().0;
@@ -382,270 +368,166 @@ fn record_audio_inner(
     let utterance_done = Arc::new(AtomicBool::new(false));
     let last_speech = Arc::new(Mutex::new(std::time::Instant::now()));
 
-    let c_ref = cancel.as_ref().map(Arc::clone);
-    let c1 = c_ref.clone();
-    let c2 = c_ref.clone();
-    let c3 = c_ref;
-
-    let s1 = (
-        Arc::clone(&samples),
-        Arc::clone(&is_speaking),
-        Arc::clone(&utterance_done),
-        Arc::clone(&last_speech),
-        c1,
-    );
-    let s2 = (
-        Arc::clone(&samples),
-        Arc::clone(&is_speaking),
-        Arc::clone(&utterance_done),
-        Arc::clone(&last_speech),
-        c2,
-    );
-    let s3 = (
-        Arc::clone(&samples),
-        Arc::clone(&is_speaking),
-        Arc::clone(&utterance_done),
-        Arc::clone(&last_speech),
-        c3,
-    );
-
     const VAD_THRESHOLD: f32 = 0.04;
     const CANCEL_THRESHOLD: f32 = 0.08;
-    const SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+    const SILENCE_TIMEOUT: Duration = Duration::from_millis(1500);
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
-            let (buf, spk, done, last, cancel_flag) = s1;
+            let buf = Arc::clone(&samples);
+            let spk = Arc::clone(&is_speaking);
+            let done = Arc::clone(&utterance_done);
+            let last = Arc::clone(&last_speech);
+            let state_ref = Arc::clone(&state);
+            let c = cancel.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let peak = data.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+                    if let Ok(mut s) = state_ref.try_lock() { s.vad_level = peak; }
+                    if let Some(ref c) = c { if peak > CANCEL_THRESHOLD { c.store(true, Ordering::Relaxed); } }
                     if peak > VAD_THRESHOLD {
-                        if let Some(ref c) = cancel_flag {
-                            if peak > CANCEL_THRESHOLD {
-                                c.store(true, Ordering::Relaxed);
-                            }
-                        }
                         spk.store(true, Ordering::Relaxed);
                         *last.lock().unwrap() = std::time::Instant::now();
                         buf.lock().unwrap().extend_from_slice(data);
                     } else if spk.load(Ordering::Relaxed) {
                         buf.lock().unwrap().extend_from_slice(data);
-                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT {
-                            done.store(true, Ordering::Relaxed);
-                        }
+                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT { done.store(true, Ordering::Relaxed); }
                     }
                 },
                 move |err| eprintln!("Audio error: {}", err),
                 None,
             )?
         }
-
         cpal::SampleFormat::I16 => {
-            let (buf, spk, done, last, cancel_flag) = s2;
+            let buf = Arc::clone(&samples);
+            let spk = Arc::clone(&is_speaking);
+            let done = Arc::clone(&utterance_done);
+            let last = Arc::clone(&last_speech);
+            let state_ref = Arc::clone(&state);
+            let c = cancel.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let peak = data
-                        .iter()
-                        .map(|&s| (s.abs() as f32) / i16::MAX as f32)
-                        .fold(0.0f32, f32::max);
+                    let peak = data.iter().map(|&s| (s.abs() as f32) / i16::MAX as f32).fold(0.0f32, f32::max);
+                    if let Ok(mut s) = state_ref.try_lock() { s.vad_level = peak; }
+                    if let Some(ref c) = c { if peak > CANCEL_THRESHOLD { c.store(true, Ordering::Relaxed); } }
                     if peak > VAD_THRESHOLD {
-                        if let Some(ref c) = cancel_flag {
-                            if peak > CANCEL_THRESHOLD {
-                                c.store(true, Ordering::Relaxed);
-                            }
-                        }
                         spk.store(true, Ordering::Relaxed);
                         *last.lock().unwrap() = std::time::Instant::now();
                         let mut b = buf.lock().unwrap();
-                        for &s in data {
-                            b.push(s as f32 / i16::MAX as f32);
-                        }
+                        for &s in data { b.push(s as f32 / i16::MAX as f32); }
                     } else if spk.load(Ordering::Relaxed) {
                         let mut b = buf.lock().unwrap();
-                        for &s in data {
-                            b.push(s as f32 / i16::MAX as f32);
-                        }
-                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT {
-                            done.store(true, Ordering::Relaxed);
-                        }
+                        for &s in data { b.push(s as f32 / i16::MAX as f32); }
+                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT { done.store(true, Ordering::Relaxed); }
                     }
                 },
                 move |err| eprintln!("Audio error: {}", err),
                 None,
             )?
         }
-
         cpal::SampleFormat::U16 => {
-            let (buf, spk, done, last, cancel_flag) = s3;
+            let buf = Arc::clone(&samples);
+            let spk = Arc::clone(&is_speaking);
+            let done = Arc::clone(&utterance_done);
+            let last = Arc::clone(&last_speech);
+            let state_ref = Arc::clone(&state);
             device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let peak = data
-                        .iter()
-                        .map(|&s| {
-                            ((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)).abs()
-                        })
-                        .fold(0.0f32, f32::max);
+                    let peak = data.iter().map(|&s| ((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)).abs()).fold(0.0f32, f32::max);
+                    if let Ok(mut s) = state_ref.try_lock() { s.vad_level = peak; }
                     if peak > VAD_THRESHOLD {
-                        if let Some(ref c) = cancel_flag {
-                            if peak > CANCEL_THRESHOLD {
-                                c.store(true, Ordering::Relaxed);
-                            }
-                        }
                         spk.store(true, Ordering::Relaxed);
                         *last.lock().unwrap() = std::time::Instant::now();
                         let mut b = buf.lock().unwrap();
-                        for &s in data {
-                            b.push((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0));
-                        }
+                        for &s in data { b.push((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)); }
                     } else if spk.load(Ordering::Relaxed) {
                         let mut b = buf.lock().unwrap();
-                        for &s in data {
-                            b.push((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0));
-                        }
-                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT {
-                            done.store(true, Ordering::Relaxed);
-                        }
+                        for &s in data { b.push((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)); }
+                        if last.lock().unwrap().elapsed() >= SILENCE_TIMEOUT { done.store(true, Ordering::Relaxed); }
                     }
                 },
                 move |err| eprintln!("Audio error: {}", err),
                 None,
             )?
         }
-
         other => return Err(format!("Unsupported sample format: {:?}", other).into()),
     };
 
     stream.play()?;
-
     while !utterance_done.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
-
     drop(stream);
     let recorded = samples.lock().unwrap().clone();
-
-    if recorded.is_empty() {
-        return Err("No audio recorded.".into());
-    }
+    if recorded.is_empty() { return Err("No audio recorded.".into()); }
 
     let mono: Vec<f32> = if channels > 1 {
-        recorded
-            .chunks_exact(channels)
-            .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-            .collect()
-    } else {
-        recorded
-    };
+        recorded.chunks_exact(channels).map(|chunk| chunk.iter().sum::<f32>() / channels as f32).collect()
+    } else { recorded };
 
-    let resampled = if sample_rate != TARGET_SAMPLE_RATE {
-        resample(&mono, sample_rate, TARGET_SAMPLE_RATE)
-    } else {
-        mono
-    };
-
+    let resampled = if sample_rate != TARGET_SAMPLE_RATE { resample(&mono, sample_rate, TARGET_SAMPLE_RATE) } else { mono };
     Ok(resampled)
 }
 
 //-----------------------------------------------------------------------------
-
-fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return input.to_vec();
-    }
-
-    let ratio = to_rate as f64 / from_rate as f64;
-    let output_len = (input.len() as f64 * ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(output_len);
-
-    for i in 0..output_len {
-        let src_idx = (i as f64 / ratio) as usize;
-        let src_idx = src_idx.min(input.len().saturating_sub(1));
-        let frac = (i as f64 / ratio) - src_idx as f64;
-
-        let next_idx = (src_idx + 1).min(input.len().saturating_sub(1));
-        let sample = input[src_idx] * (1.0 - frac as f32) + input[next_idx] * frac as f32;
-        output.push(sample);
-    }
-
-    output
-}
-
+// TTS
 //-----------------------------------------------------------------------------
 
-fn save_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+fn compute_vu_levels(wav_path: &str) -> Vec<f32> {
+    let mut levels = Vec::new();
+    let mut reader = match hound::WavReader::open(wav_path) {
+        Ok(r) => r, Err(_) => return levels,
     };
-
-    let mut writer = hound::WavWriter::create(path, spec)?;
-
-    for &sample in samples {
-        let amplitude = i16::MAX as f32;
-        writer.write_sample((sample * amplitude) as i16)?;
-    }
-
-    writer.finalize()?;
-    Ok(())
-}
-
-//-----------------------------------------------------------------------------
-
-fn transcribe_via_whisper(wav_path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
-    let whisper_path = cwd.join(WHISPER_EXE_PATH);
-    let model_path = cwd.join(WHISPER_MODEL_PATH);
-
-    let output = Command::new(&whisper_path)
-        .args([
-            "-m", &model_path.to_string_lossy(),
-            "-f", wav_path,
-            "-nt",
-            "-np",
-            "-l", "de",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("whisper.cpp failed: {}", stderr).into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let text = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string();
-
-    Ok(text)
-}
-
-//-----------------------------------------------------------------------------
-
-fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
-    if text.trim().is_empty() {
-        return Ok(());
-    }
-
-    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
-    let _listener = std::thread::spawn(move || {
-        let mut _buf = String::new();
-        if io::stdin().read_line(&mut _buf).is_ok() {
-            let _ = tx_stop.send(());
+    let spec = reader.spec();
+    let frame_samples = (spec.sample_rate as usize / 20).max(1) * spec.channels as usize;
+    let mut chunk = Vec::with_capacity(frame_samples);
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let divisor = match spec.bits_per_sample {
+                8 => i16::from(i8::MAX) as f32, 16 => i16::MAX as f32,
+                24 => 8388607.0f32, 32 => 2147483647.0f32, _ => i16::MAX as f32,
+            };
+            for sample in reader.samples::<i16>() {
+                if let Ok(s) = sample {
+                    chunk.push(s as f32 / divisor);
+                    if chunk.len() >= frame_samples {
+                        levels.push(chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max));
+                        chunk.clear();
+                    }
+                }
+            }
         }
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                if let Ok(s) = sample {
+                    chunk.push(s);
+                    if chunk.len() >= frame_samples {
+                        levels.push(chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max));
+                        chunk.clear();
+                    }
+                }
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        levels.push(chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max));
+    }
+    levels
+}
+
+fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std::error::Error>> {
+    if text.trim().is_empty() { return Ok(()); }
+
+    let (tx_stop, rx_stop) = mpsc::channel::<()>();
+    let _listener = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if io::stdin().read_line(&mut buf).is_ok() { let _ = tx_stop.send(()); }
     });
 
-    let interrupted = || -> bool {
-        rx_stop.try_recv().is_ok() || cancel.load(Ordering::Relaxed)
-    };
+    let interrupted = || -> bool { rx_stop.try_recv().is_ok() || cancel.load(Ordering::Relaxed) };
 
     let cwd = std::env::current_dir()?;
     let piper_exe = cwd.join(PIPER_DIR).join("piper.exe");
@@ -656,68 +538,54 @@ fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error:
         let wav_path = temp_wav.to_string_lossy().to_string();
 
         let mut piper_proc = Command::new(&piper_exe)
-            .args([
-                "--model", &piper_voice.to_string_lossy(),
-                "--output-file", &wav_path,
-            ])
+            .args(["--model", &piper_voice.to_string_lossy(), "--output-file", &wav_path])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-
-        if let Some(mut stdin) = piper_proc.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
+        if let Some(mut stdin) = piper_proc.stdin.take() { stdin.write_all(text.as_bytes())?; }
         let _ = piper_proc.wait();
 
+        let vu_levels = compute_vu_levels(&wav_path);
+        let total_frames = vu_levels.len();
+
         let mut play = Command::new("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                &format!("(New-Object System.Media.SoundPlayer '{}').PlaySync()", wav_path),
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                   &format!("(New-Object System.Media.SoundPlayer '{}').PlaySync()", wav_path)])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
+        let vu_start = std::time::Instant::now();
         loop {
-            if let Ok(Some(_)) = play.try_wait() {
-                break;
-            }
-            if interrupted() {
-                let _ = play.kill();
-                break;
+            if let Ok(Some(_)) = play.try_wait() { break; }
+            if interrupted() { let _ = play.kill(); break; }
+
+            let elapsed = vu_start.elapsed();
+            if total_frames > 0 {
+                let frame = (elapsed.as_secs_f64() * 20.0) as usize;
+                let idx = frame.min(total_frames - 1);
+                if let Ok(mut s) = state.try_lock() { s.vu_level = vu_levels[idx]; }
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
         }
 
-        print!("\r{}", " ".repeat(40));
-
+        if let Ok(mut s) = state.try_lock() { s.vu_level = 0.0; }
         let _ = std::fs::remove_file(&temp_wav);
     } else {
         let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak([Console]::In.ReadToEnd())",
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                   "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak([Console]::In.ReadToEnd())"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-
+        if let Some(mut stdin) = child.stdin.take() { stdin.write_all(text.as_bytes())?; }
         loop {
-            if let Ok(Some(_)) = child.try_wait() {
-                break;
-            }
-            if interrupted() {
-                let _ = child.kill();
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(Some(_)) = child.try_wait() { break; }
+            if interrupted() { let _ = child.kill(); break; }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -725,244 +593,383 @@ fn speak_text(text: &str, cancel: &AtomicBool) -> Result<(), Box<dyn std::error:
 }
 
 //-----------------------------------------------------------------------------
-
-fn is_meaningful_speech(text: &str) -> bool {
-    let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    let lower = t.to_lowercase();
-    if lower.contains("[blank_audio]") || lower.contains("[music") || lower.contains("[laughter]")
-        || lower.contains("[sound") || lower.contains("[noise]")
-    {
-        return false;
-    }
-    true
-}
-
+// Conversation thread
 //-----------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    // Check for Windows 11
-    #[cfg(target_os = "windows")]
-    {
-        if is_windows_11() {
-            println!("✅ Windows 11 detected.");
-        } else {
-            println!("{}", "❌ No Windows 11!".red());
-            std::process::exit(1);
-        }
-    }
-
-    // Check for ollama
-    if ollama_is_installed() {
-        println!("✅ Ollama is already installed.");
-    } else {
-        println!("{} Installing Ollama!", "Ollama not found!".red());
-
-        if install_ollama() {
-            println!("✅ Installation successful!");
-        } else {
-            eprintln!("{}", "❌ Installation failed!".red());
-            std::process::exit(1);
-        }        
-    }
-
-    // Check for AI model 'phi4'
-    if phi4_is_installed() {
-        println!("✅ Model 'phi4' is already installed.");
-    } else {
-        println!("{} Installing model!", "Model 'phi4' is missing.".red());
-
-        if install_phi4() {
-            println!("✅ Model 'phi4' successfully installed.");
-        } else {
-            eprintln!("{}", "❌ Installation failed!".red());
-            std::process::exit(1);
-        }
-    }
-
-    // Download whisper model + binary for STT
-    let client = Client::new();
-    download_whisper_model(&client).await?;
-    download_whisper_binary(&client).await?;
-
-    // Download Piper TTS binary and German voice model (optional; falls back to System.Speech)
-    if let Err(e) = download_piper_binary(&client).await {
-        eprintln!("{} {} {}", "Warning:".yellow(), "Piper TTS binary download failed:".yellow(), e);
-    }
-    if let Err(e) = download_piper_voice(&client).await {
-        eprintln!("{} {} {}", "Warning:".yellow(), "Piper voice model download failed:".yellow(), e);
-    }
-
-    println!("\nOllama Streaming Chat (Speech-to-Text)");
-    println!("Type 'exit' to quit.");
-
-    let system_content = "Du bist ein hilfreicher Assistent. Antworte immer in natürlicher, gesprächsorientierter Sprache wie ein Mensch. Vermeide Aufzählungen, Listen, Programmcode, mathematische Formeln, Tabellen und jede Art von strukturierter Darstellung. Deine Antworten sollen sich anhören wie ein normales Gespräch unter Freunden.";
-
-    let mut history: Vec<Message> = vec![
-        Message {
-            role: "system".to_string(),
-            content: system_content.to_string(),
-        }
-    ];
-
+fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiCommand>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let client = Client::new();
 
-    let mut audio = record_audio_push_to_talk()?;
+    let mut history: Vec<Message> = vec![Message {
+        role: "system".to_string(),
+        content: SYSTEM_PROMPT.to_string(),
+    }];
 
     loop {
-        let wav_path = std::env::temp_dir().join("ollama_chat_input.wav");
-        let wav_str = wav_path.to_str().ok_or("Invalid temp path")?;
-
-        if let Err(e) = save_wav(wav_str, &audio, TARGET_SAMPLE_RATE) {
-            eprintln!("{} {}", "WAV error:".red(), e);
-            audio = record_audio_push_to_talk()?;
-            continue;
+        // Wait for start command
+        let cmd = match cmd_rx.recv() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        match cmd {
+            UiCommand::Exit => break,
+            UiCommand::StartRecording => {}
         }
 
-        print!("{}", "Transcribing...".blue());
-        io::stdout().flush()?;
+        // Listening phase
+        {
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Listening;
+            s.status_text = "🎤 Listening...".into();
+            s.vad_level = 0.0;
+            s.error = None;
+        }
 
-        let input = match transcribe_via_whisper(wav_str) {
-            Ok(text) => {
-                println!("\r{}", " ".repeat(80));
-                println!("{} {}", "You:".green(), text);
-                text
-            }
-            Err(e) => {
-                eprintln!("\r{} {}", "STT error:".red(), e);
-                audio = record_audio_push_to_talk()?;
+        // Record audio
+        let audio = match record_audio_inner(None, Arc::clone(&state)) {
+            Ok(a) => a,
+            Err(_) => {
+                let mut s = state.lock().unwrap();
+                s.phase = Phase::Ready;
+                s.status_text = "Press ENTER to start speaking".into();
                 continue;
             }
         };
 
-        if input.eq_ignore_ascii_case("exit") {
-            break;
+        // Transcribing phase
+        {
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Transcribing;
+            s.status_text = "Transcribing...".into();
         }
 
-        if !is_meaningful_speech(&input) {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            audio = record_audio_push_to_talk()?;
+        let wav_path = std::env::temp_dir().join("ollama_chat_input.wav");
+        let wav_str = wav_path.to_str().unwrap_or("ollama_chat_input.wav");
+        if let Err(e) = save_wav(wav_str, &audio, TARGET_SAMPLE_RATE) {
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Ready;
+            s.status_text = "Press ENTER to start speaking".into();
+            s.error = Some(format!("WAV error: {}", e));
             continue;
         }
 
-        history.push(Message {
-            role: "user".to_string(),
-            content: input.to_string(),
-        });
+        let input = match transcribe_via_whisper(wav_str) {
+            Ok(t) => t,
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.phase = Phase::Ready;
+                s.status_text = "Press ENTER to start speaking".into();
+                s.error = Some(format!("STT error: {}", e));
+                continue;
+            }
+        };
+        let _ = std::fs::remove_file(&wav_path);
 
-        // Ollama request
-        let body = json!({
-            "model": "phi4",
-            "stream": true,
-            "messages": history
-        });
+        if !is_meaningful_speech(&input) {
+            {
+                let mut s = state.lock().unwrap();
+                s.phase = Phase::Ready;
+                s.status_text = "Press ENTER to start speaking".into();
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
 
-        let response = client
-            .post("http://localhost:11434/api/chat")
-            .json(&body)
-            .send()
-            .await?;
+        // Add user message
+        {
+            let mut s = state.lock().unwrap();
+            s.messages.push(ChatEntry { role: "user".to_string(), content: input.clone() });
+        }
 
-        let mut stream = response.bytes_stream();
+        history.push(Message { role: "user".to_string(), content: input });
 
-        println!("\n{}\n", "AI:".blue());
+        // Thinking phase
+        {
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Thinking;
+            s.status_text = "Thinking...".into();
+        }
 
-        let mut full_response = String::new();
+        // Ollama request (async via tokio runtime)
+        let body = json!({ "model": "phi4", "stream": true, "messages": history.clone() });
 
+        let response = match rt.block_on(async {
+            client.post("http://localhost:11434/api/chat").json(&body).send().await
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.phase = Phase::Ready;
+                s.status_text = "Press ENTER to start speaking".into();
+                s.error = Some(format!("Ollama error: {}", e));
+                continue;
+            }
+        };
+
+        // Stream processing + streaming TTS
         let tts_cancel = Arc::new(AtomicBool::new(false));
-        let tts_cancel_vad = Arc::clone(&tts_cancel);
 
-        // Channel for streaming TTS segments
+        // Pre-allocate TTS channel
         let (tts_tx, tts_rx) = mpsc::channel::<String>();
         let tts_cancel_tts = Arc::clone(&tts_cancel);
+        let tts_state = Arc::clone(&state);
         let tts_handle = std::thread::spawn(move || {
             while let Ok(segment) = tts_rx.recv() {
-                if tts_cancel_tts.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Err(e) = speak_text(&segment, &tts_cancel_tts) {
-                    eprintln!("{} {}", "TTS error:".red(), e);
+                if tts_cancel_tts.load(Ordering::Relaxed) { break; }
+                if let Err(e) = speak_text(&segment, &tts_cancel_tts, Arc::clone(&tts_state)) {
+                    eprintln!("TTS error: {}", e);
                     break;
                 }
             }
         });
 
-        // Stream processing
+        let mut full_response = String::new();
         let mut tts_buffer = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
 
+        {
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Speaking;
+            s.status_text = "Speaking... (Enter to interrupt)".into();
+        }
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = rt.block_on(stream.next()) {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => break,
+            };
             let text = String::from_utf8_lossy(&chunk);
-
             for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                if let Ok(parsed) = serde_json::from_str::<OllamaChunk>(&line) {
+                if line.trim().is_empty() { continue; }
+                if let Ok(parsed) = serde_json::from_str::<OllamaChunk>(line) {
                     if let Some(msg) = parsed.message {
                         if let Some(content) = msg.content {
-                            print!("{content}");
-                            io::stdout().flush()?;
-
                             full_response.push_str(&content);
                             tts_buffer.push_str(&content);
 
-                            if tts_buffer.len() >= 80 && (tts_buffer.ends_with('.') || tts_buffer.ends_with('!') || tts_buffer.ends_with('?')) {
+                            if tts_buffer.len() >= 80
+                                && (tts_buffer.ends_with('.') || tts_buffer.ends_with('!') || tts_buffer.ends_with('?'))
+                            {
                                 let segment = std::mem::take(&mut tts_buffer);
                                 let _ = tts_tx.send(segment);
                             }
                         }
                     }
-
-                    if parsed.done == Some(true) {
-                        break;
-                    }
+                    if parsed.done == Some(true) { break; }
                 }
             }
         }
 
-        // Flush remaining text to TTS
         if !tts_buffer.is_empty() {
             let _ = tts_tx.send(std::mem::take(&mut tts_buffer));
         }
         drop(tts_tx);
 
-        println!("\n");
-
-        // Head start before VAD listening
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        print!("{}", "\n🎤 Listening... (speak to interrupt or respond)".yellow());
-        io::stdout().flush()?;
-
-        audio = match record_audio_interrupt(Arc::clone(&tts_cancel_vad)) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("{} {}", "Recording error:".red(), e);
-                tts_cancel_vad.store(true, Ordering::Relaxed);
-                let _ = tts_handle.join();
-                audio = record_audio_push_to_talk()?;
-                continue;
-            }
-        };
-
         let _ = tts_handle.join();
 
-        // Save assistant message
-        history.push(Message {
-            role: "assistant".to_string(),
-            content: full_response,
-        });
+        // Add assistant message
+        {
+            let mut s = state.lock().unwrap();
+            s.messages.push(ChatEntry { role: "assistant".to_string(), content: full_response.clone() });
+            s.phase = Phase::Ready;
+            s.status_text = "Press ENTER to start speaking".into();
+            s.vu_level = 0.0;
+        }
+
+        history.push(Message { role: "assistant".to_string(), content: full_response });
     }
-
-    println!("\nGoodbye! 👋");
-
-    Ok(())
 }
 
 //-----------------------------------------------------------------------------
+// TUI rendering
+//-----------------------------------------------------------------------------
+
+fn ui(f: &mut ratatui::Frame, state: &AppState) {
+    let size = f.size();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(4)])
+        .split(size);
+
+    // Title
+    let title = Paragraph::new("Ollama Chat  —  Speech-to-Text  —  phi4 + whisper.cpp + Piper TTS")
+        .block(Block::default().borders(Borders::ALL).title(" AI Chat "));
+    f.render_widget(title, chunks[0]);
+
+    // Chat area
+    let chat_rect = chunks[1];
+    let inner = Rect { x: chat_rect.x + 1, y: chat_rect.y + 1, width: chat_rect.width.saturating_sub(2), height: chat_rect.height.saturating_sub(2) };
+    let block = Block::default().borders(Borders::ALL).title(" Conversation ");
+    f.render_widget(block, chat_rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in &state.messages {
+        let prefix = if entry.role == "user" { "You: " } else { "AI: " };
+        for line_text in entry.content.lines() {
+            lines.push(Line::from(Span::raw(format!("{}{}", prefix, line_text))));
+        }
+    }
+    if state.phase == Phase::Thinking || state.phase == Phase::Speaking {
+
+    }
+    if let Some(ref err) = state.error {
+        lines.push(Line::from(Span::raw(format!("Error: {}", err))));
+    }
+
+    let scroll = lines.len().saturating_sub(inner.height as usize);
+    let chat = Paragraph::new(lines.clone())
+        .scroll((scroll as u16, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(chat, inner);
+
+    // Status bar
+    let status_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(30), Constraint::Min(5), Constraint::Length(20)])
+        .split(chunks[2]);
+    let status_block = Block::default().borders(Borders::ALL).title(" Status ");
+    f.render_widget(status_block, chunks[2]);
+
+    // Phase + status text
+    let phase_style = match state.phase {
+        Phase::Ready => Style::default().fg(Color::Green),
+        Phase::Listening => Style::default().fg(Color::Yellow),
+        Phase::Transcribing => Style::default().fg(Color::Cyan),
+        Phase::Thinking => Style::default().fg(Color::Magenta),
+        Phase::Speaking => Style::default().fg(Color::Blue),
+    };
+    let phase_text = Paragraph::new(Line::from(Span::styled(&state.status_text, phase_style)));
+    f.render_widget(phase_text, status_chunks[0]);
+
+    // VU meter
+    let vu_label = format!("VU: {:>3}%", (state.vu_level * 100.0) as u8);
+    let vu_gauge = Gauge::default()
+        .block(Block::default().borders(Borders::NONE))
+        .gauge_style(Style::default().fg(if state.vu_level > 0.7 { Color::Red } else if state.vu_level > 0.4 { Color::Yellow } else { Color::Green }))
+        .percent((state.vu_level * 100.0) as u16)
+        .label(vu_label);
+    f.render_widget(vu_gauge, status_chunks[1]);
+
+    // VAD meter
+    let vad_label = format!("VAD: {:>3}%", (state.vad_level * 100.0) as u8);
+    let vad_gauge = Gauge::default()
+        .block(Block::default().borders(Borders::NONE))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .percent((state.vad_level * 100.0).min(100.0) as u16)
+        .label(vad_label);
+    f.render_widget(vad_gauge, status_chunks[2]);
+}
+
+//-----------------------------------------------------------------------------
+// TUI main loop
+//-----------------------------------------------------------------------------
+
+fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let res = loop {
+        // Render
+        {
+            let state_guard = state.lock().unwrap();
+            terminal.draw(|f| ui(f, &state_guard))?;
+        }
+
+        // Handle keyboard
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        let _ = cmd_tx.send(UiCommand::Exit);
+                        break Ok(());
+                    }
+                    KeyCode::Enter => {
+                        let s = state.lock().unwrap();
+                        if s.phase == Phase::Ready {
+                            drop(s);
+                            let _ = cmd_tx.send(UiCommand::StartRecording);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    res
+}
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Ollama Chat 2 — Speech-to-Text Assistant".green().bold());
+
+    // Windows 11 check
+    #[cfg(target_os = "windows")]
+    {
+        if is_windows_11() {
+            println!("✅ Windows 11 detected.");
+        } else {
+            println!("{}", "⚠️  Windows 11 recommended.".yellow());
+        }
+    }
+
+    // Ollama
+    if !ollama_is_installed() {
+        println!("{} Installing Ollama...", "Ollama missing.".red());
+        if !install_ollama() {
+            eprintln!("{} Failed to install Ollama. Install manually: https://ollama.com", "Error:".red());
+            std::process::exit(1);
+        }
+    } else {
+        println!("✅ Ollama is already installed.");
+    }
+
+    // phi4
+    if !phi4_is_installed() {
+        println!("{} Downloading phi4 model (~3 GB)...", "Model missing.".red());
+        if !install_phi4() {
+            eprintln!("{}", "Failed to pull phi4 model.".red());
+            std::process::exit(1);
+        }
+    } else {
+        println!("✅ Model 'phi4' is already installed.");
+    }
+
+    let client = Client::new();
+    download_whisper_model(&client).await?;
+    download_whisper_binary(&client).await?;
+    download_piper_binary(&client).await?;
+    download_piper_voice(&client).await?;
+    println!();
+
+    // Start TUI
+    let state = Arc::new(Mutex::new(AppState::new()));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+
+    // Spawn conversation thread
+    let conv_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        conversation_loop(conv_state, cmd_rx);
+    });
+
+    // Run TUI
+    if let Err(e) = run_tui(state, cmd_tx) {
+        eprintln!("{} {}", "TUI error:".red(), e);
+    }
+
+    println!("\nGoodbye! 👋");
+    Ok(())
+}

@@ -1,6 +1,6 @@
 [package]
 name = "ollama_chat2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -15,4 +15,5 @@ owo-colors = "4"
 winreg = "0.52"
 cpal = "0.15"
 hound = "3.5"
-
+ratatui = "0.26"
+crossterm = "0.27"

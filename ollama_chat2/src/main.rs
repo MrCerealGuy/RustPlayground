@@ -46,11 +46,15 @@ const PIPER_VOICE_JSON_URL: &str =
 //const SYSTEM_PROMPT: &str = "Du bist ein hilfreicher Assistent, der ausschließlich in natürlich gesprochener Sprache antwortet. STRIKTES VERBOT von: Programmcode (egal welche Sprache), JavaScript, Python, HTML, CSS, Shell-Befehle, SQL, mathematische Formeln, LaTeX, Aufzählungen, Listen, nummerierte Schritte, Tabellen, Sternchen-Aufzählungen, Gedankenstriche, Sonderzeichen oder Formatierungen. Erkläre Konzepte in ganzen Sätzen ohne Beispiele in Code. Antworte als würdest du mit einem Freund sprechen – fließend, natürlich und direkt vorlesbar.";
 const SYSTEM_PROMPT: &str = "";
 
+const HISTORY_FILE: &str = "conversation_history.json";
+
+static TTS_CANCEL: AtomicBool = AtomicBool::new(false);
+
 //-----------------------------------------------------------------------------
 // Types
 //-----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
     role: String,
     content: String,
@@ -81,6 +85,16 @@ enum Phase {
     Speaking,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum Emotion {
+    Neutral,
+    Happy,
+    Sad,
+    Angry,
+    Surprised,
+    Thinking,
+}
+
 struct AppState {
     messages: Vec<ChatEntry>,
     phase: Phase,
@@ -93,6 +107,8 @@ struct AppState {
     search_query: String,
     search_result: String,
     search_show_until: Option<std::time::Instant>,
+    tts_stop: bool,
+    emotion: Emotion,
 }
 
 impl AppState {
@@ -109,6 +125,8 @@ impl AppState {
             search_query: String::new(),
             search_result: String::new(),
             search_show_until: None,
+            tts_stop: false,
+            emotion: Emotion::Neutral,
         }
     }
 }
@@ -972,7 +990,12 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
         if io::stdin().read_line(&mut buf).is_ok() { let _ = tx_stop.send(()); }
     });
 
-    let interrupted = || -> bool { rx_stop.try_recv().is_ok() || cancel.load(Ordering::Relaxed) };
+    let interrupted = || -> bool {
+        rx_stop.try_recv().is_ok()
+        || cancel.load(Ordering::Relaxed)
+        || TTS_CANCEL.load(Ordering::Relaxed)
+        || state.try_lock().map(|s| s.tts_stop).unwrap_or(false)
+    };
 
     let cwd = std::env::current_dir()?;
     let piper_exe = cwd.join(PIPER_DIR).join("piper.exe");
@@ -989,7 +1012,15 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
             .stderr(std::process::Stdio::null())
             .spawn()?;
         if let Some(mut stdin) = piper_proc.stdin.take() { stdin.write_all(text.as_bytes())?; }
-        let _ = piper_proc.wait();
+        // Poll for Piper completion while checking stop flag
+        loop {
+            if let Ok(Some(_)) = piper_proc.try_wait() { break; }
+            if TTS_CANCEL.load(Ordering::Relaxed) { let _ = piper_proc.kill(); break; }
+            if let Ok(s) = state.try_lock() {
+                if s.tts_stop { let _ = piper_proc.kill(); break; }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         let vu_levels = compute_vu_levels(&wav_path);
         let total_frames = vu_levels.len();
@@ -1005,6 +1036,14 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
         loop {
             if let Ok(Some(_)) = play.try_wait() { break; }
             if interrupted() { let _ = play.kill(); break; }
+            // Check state-level stop flag (set by TUI thread)
+            {
+                let s = state.lock().unwrap();
+                if s.tts_stop {
+                    let _ = play.kill();
+                    break;
+                }
+            }
 
             let elapsed = vu_start.elapsed();
             if total_frames > 0 {
@@ -1030,11 +1069,30 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
         loop {
             if let Ok(Some(_)) = child.try_wait() { break; }
             if interrupted() { let _ = child.kill(); break; }
+            if let Ok(s) = state.try_lock() {
+                if s.tts_stop { let _ = child.kill(); break; }
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     Ok(())
+}
+
+fn save_history(history: &[Message]) {
+    // Skip the system prompt (first message)
+    let msgs: Vec<&Message> = history.iter().filter(|m| m.role != "system").collect();
+    if let Ok(json) = serde_json::to_string_pretty(&msgs) {
+        let _ = std::fs::write(HISTORY_FILE, json);
+    }
+}
+
+fn load_history() -> Vec<Message> {
+    let content = match std::fs::read_to_string(HISTORY_FILE) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    serde_json::from_str(&content).unwrap_or_default()
 }
 
 //-----------------------------------------------------------------------------
@@ -1049,6 +1107,19 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         role: "system".to_string(),
         content: SYSTEM_PROMPT.to_string(),
     }];
+
+    // Load saved conversation and restore display messages
+    let saved = load_history();
+    for msg in &saved {
+        history.push(msg.clone());
+    }
+    {
+        let mut s = state.lock().unwrap();
+        s.messages = saved.iter().map(|m| ChatEntry {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        }).collect();
+    }
 
     loop {
         // Check for exit (non-blocking)
@@ -1182,7 +1253,15 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         };
 
         // Stream processing + streaming TTS
-        let tts_cancel = Arc::new(AtomicBool::new(false));
+        // Check if user pressed Enter during thinking
+        let user_requested_stop = {
+            let mut s = state.lock().unwrap();
+            let stop = s.tts_stop || TTS_CANCEL.load(Ordering::Relaxed);
+            s.tts_stop = false;
+            TTS_CANCEL.store(false, Ordering::Relaxed);
+            stop
+        };
+        let tts_cancel = Arc::new(AtomicBool::new(user_requested_stop));
 
         let (tts_tx, tts_rx) = mpsc::channel::<String>();
         let tts_cancel_tts = Arc::clone(&tts_cancel);
@@ -1190,6 +1269,12 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         let tts_handle = std::thread::spawn(move || {
             while let Ok(segment) = tts_rx.recv() {
                 if tts_cancel_tts.load(Ordering::Relaxed) { break; }
+                if TTS_CANCEL.load(Ordering::Relaxed) { break; }
+                // Also check state.stop
+                {
+                    let s = tts_state.lock().unwrap();
+                    if s.tts_stop { break; }
+                }
                 if let Err(e) = speak_text(&segment, &tts_cancel_tts, Arc::clone(&tts_state)) {
                     eprintln!("TTS error: {}", e);
                     break;
@@ -1209,6 +1294,12 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = rt.block_on(stream.next()) {
+            if tts_cancel.load(Ordering::Relaxed) { break; }
+            if TTS_CANCEL.load(Ordering::Relaxed) { break; }
+            // Also check if TUI thread requested stop via state
+            if let Ok(s) = state.try_lock() {
+                if s.tts_stop { break; }
+            }
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(_) => break,
@@ -1241,6 +1332,10 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                                 if let Some(last) = s.messages.last_mut() {
                                     last.content = full_response.clone();
                                 }
+                                // Update emotion during streaming
+                                if full_response.len() > 10 {
+                                    s.emotion = detect_emotion(&full_response);
+                                }
                             }
                         }
                     }
@@ -1254,6 +1349,9 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         }
         drop(tts_tx);
 
+        // Detect emotion from full response
+        let ai_emotion = detect_emotion(&full_response);
+
         let _ = tts_handle.join();
 
         {
@@ -1264,6 +1362,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             s.phase = Phase::Listening;
             s.status_text = "Listening...".into();
             s.vu_level = 0.0;
+            s.emotion = ai_emotion;
         }
 
         if !full_response.is_empty() {
@@ -1286,6 +1385,91 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             }
         }
     }
+    save_history(&history);
+}
+
+//-----------------------------------------------------------------------------
+// Emotion detection & ASCII face art
+//-----------------------------------------------------------------------------
+
+fn detect_emotion(text: &str) -> Emotion {
+    let lower = text.to_lowercase();
+    let has = |kws: &[&str]| kws.iter().any(|k| lower.contains(k));
+    if has(&["😂", "😊", "😄", "😍", "🥰", "freut", "lacht", "großartig",
+             "wunderbar", "fantastisch", "toll", "super", "begeistert",
+             "lustig", "schön", "glücklich", "fröhlich", "lächeln",
+             "yay", "juhu", "hurra", "herrlich"])
+    { return Emotion::Happy; }
+    if has(&["😢", "😭", "😔", "😞", "traurig", "schade", "bedauerlich",
+             "enttäuscht", "leid", "weinen", "kummer", "melancholie",
+             "einsam", "vermisst", "niedergeschlagen", "herzzerreißend"])
+    { return Emotion::Sad; }
+    if has(&["😠", "😡", "🤬", "wütend", "ärgerlich", "verärgert",
+             "frustriert", "genervt", "sauer", "empört", "zornig",
+             "rasend", "verflucht"])
+    { return Emotion::Angry; }
+    if has(&["😮", "😲", "😯", "😱", "überraschend", "unglaublich",
+             "erstaunlich", "verblüffend", "krass",
+             "tatsächlich", "aha", "bemerkenswert"])
+    { return Emotion::Surprised; }
+    if has(&["🤔", "🧐", "hmm", "überlege", "nachdenken", "vielleicht",
+             "möglicherweise", "interessant", "lasst mich", "mal sehen",
+             "gute frage", "schwierig", "überleg"])
+    { return Emotion::Thinking; }
+    Emotion::Neutral
+}
+
+fn face_lines(emotion: Emotion) -> &'static [&'static str] {
+    match emotion {
+        Emotion::Neutral => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| o   o |",
+            "|   ^   |",
+            " \\ ___ / ",
+            " Neutral ",
+        ],
+        Emotion::Happy => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| ^   ^ |",
+            "|   U   |",
+            " \\ ___ / ",
+            "  Happy  ",
+        ],
+        Emotion::Sad => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| .   . |",
+            "|   T   |",
+            " \\ ___ / ",
+            "   Sad   ",
+        ],
+        Emotion::Angry => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| >   < |",
+            "|   !   |",
+            " \\ ___ / ",
+            "  Angry  ",
+        ],
+        Emotion::Surprised => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| O   O |",
+            "|   o   |",
+            " \\ ___ / ",
+            "Surprised",
+        ],
+        Emotion::Thinking => &[
+            "  .---.  ",
+            " /     \\ ",
+            "| o   o |",
+            "|   ?   |",
+            " \\ ___ / ",
+            "Thinking ",
+        ],
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -1305,11 +1489,35 @@ fn ui(f: &mut ratatui::Frame, state: &AppState, scroll_offset: &mut usize) {
         .block(Block::default().borders(Borders::ALL).title(" AI Chat "));
     f.render_widget(title, chunks[0]);
 
-    // Chat area
-    let chat_rect = chunks[1];
+    // Split chat area horizontally: conversation | face
+    let face_width: u16 = 22;
+    let (chat_rect, face_rect) = if size.width >= 60 && size.height >= 15 {
+        let horiz = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(face_width)])
+            .split(chunks[1]);
+        (horiz[0], horiz[1])
+    } else {
+        // Terminal too small, use full width for conversation, no face
+        (chunks[1], Rect::default())
+    };
+
+    // Conversation area
     let inner = Rect { x: chat_rect.x + 1, y: chat_rect.y + 1, width: chat_rect.width.saturating_sub(2), height: chat_rect.height.saturating_sub(2) };
     let block = Block::default().borders(Borders::ALL).title(" Conversation ");
     f.render_widget(block, chat_rect);
+
+    // Face area
+    if face_rect.width > 0 && face_rect.height > 0 {
+        let face_block = Block::default().borders(Borders::ALL).title(" AI ");
+        let face_inner = Rect { x: face_rect.x + 1, y: face_rect.y + 1, width: face_rect.width.saturating_sub(2), height: face_rect.height.saturating_sub(2) };
+        let lines = face_lines(state.emotion);
+        let max_visible = face_inner.height as usize;
+        let display_lines: Vec<Line> = lines.iter().take(max_visible).map(|l| Line::from(Span::raw(*l))).collect();
+        let face_para = Paragraph::new(display_lines);
+        f.render_widget(face_block, face_rect);
+        f.render_widget(face_para, face_inner);
+    }
 
 // Pre-wrap long lines at inner.width to keep lines.len() == visual lines
 let max_width = inner.width.saturating_sub(2) as usize;
@@ -1469,6 +1677,12 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
                     }
                     KeyCode::Up => scroll_offset = scroll_offset.saturating_add(1),
                     KeyCode::Down => scroll_offset = scroll_offset.saturating_sub(1),
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                        TTS_CANCEL.store(true, Ordering::Relaxed);
+                        if let Ok(mut s) = state.try_lock() {
+                            s.tts_stop = true;
+                        }
+                    }
                     _ => {}
                 }
             }

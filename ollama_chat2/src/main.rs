@@ -1373,7 +1373,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             let mut s = state.lock().unwrap();
             s.messages.push(ChatEntry { role: "assistant".to_string(), content: String::new() });
             s.phase = Phase::Speaking;
-            s.status_text = "Speaking... (Enter to interrupt)".into();
+            s.status_text = "Speaking...\nSprich zum Unterbrechen".into();
         }
 
         let mut stream = response.bytes_stream();
@@ -1543,10 +1543,16 @@ for entry in &state.messages {
     f.render_widget(chat, inner);
 
     // Status bar
+    let status_inner = Rect {
+        x: chunks[2].x + 1,
+        y: chunks[2].y + 1,
+        width: chunks[2].width.saturating_sub(2),
+        height: chunks[2].height.saturating_sub(2),
+    };
     let status_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(30), Constraint::Min(5), Constraint::Length(20)])
-        .split(chunks[2]);
+        .split(status_inner);
     let status_block = Block::default().borders(Borders::ALL).title(" Status ");
     f.render_widget(status_block, chunks[2]);
 
@@ -1557,7 +1563,8 @@ for entry in &state.messages {
         Phase::Thinking => Style::default().fg(Color::Magenta),
         Phase::Speaking => Style::default().fg(Color::Blue),
     };
-    let phase_text = Paragraph::new(Line::from(Span::styled(&state.status_text, phase_style)));
+    let phase_text = Paragraph::new(state.status_text.clone())
+        .style(phase_style);
     f.render_widget(phase_text, status_chunks[0]);
 
     // VU meter
@@ -1631,6 +1638,64 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
     terminal.clear()?;
 
     let mut scroll_offset = 0usize;
+
+    // Background WinAPI console reader for exit keys 'q' and Esc
+    // (bypasses crossterm which may not detect these on some terminals)
+    let _exit_listener = std::thread::spawn(|| {
+        #[cfg(windows)]
+        unsafe {
+            use std::mem::zeroed;
+            const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6u32;
+            const KEY_EVENT: u16 = 0x0001;
+            const VK_Q: u16 = 0x51;
+            const VK_ESCAPE: u16 = 0x1B;
+            type HANDLE = isize;
+            unsafe extern "system" {
+                fn GetStdHandle(nStdHandle: u32) -> HANDLE;
+                fn ReadConsoleInputW(h: HANDLE, buf: *mut u8, len: u32, read: *mut u32) -> i32;
+                fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
+            }
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            #[allow(non_snake_case)]
+            struct KeyEventRecord {
+                bKeyDown: i32,
+                _wRepeatCount: u16,
+                wVirtualKeyCode: u16,
+                _wVirtualScanCode: u16,
+                _uChar: u16,
+                _dwControlKeyState: u32,
+            }
+            #[repr(C)]
+            union EventUnion { key: KeyEventRecord }
+            #[repr(C)]
+            struct InputRecord { event_type: u16, event: EventUnion }
+
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            if h == -1 as HANDLE { return; }
+            loop {
+                if WaitForSingleObject(h, 500) == 0 {
+                    let mut rec: InputRecord = zeroed();
+                    let mut n: u32 = 0;
+                    if ReadConsoleInputW(h, &mut rec as *mut _ as *mut u8, 1, &mut n) != 0 && n >= 1
+                        && rec.event_type == KEY_EVENT
+                    {
+                        let k = rec.event.key;
+                        if k.bKeyDown != 0
+                            && (k.wVirtualKeyCode == VK_Q || k.wVirtualKeyCode == VK_ESCAPE)
+                        {
+                            SHUTDOWN.store(true, Ordering::Relaxed);
+                            TTS_CANCEL.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                if SHUTDOWN.load(Ordering::Relaxed) { break; }
+            }
+        }
+        #[cfg(not(windows))]
+        std::thread::sleep(Duration::from_secs(u64::MAX));
+    });
 
     let res = loop {
         if SHUTDOWN.load(Ordering::Relaxed) { break Ok(()); }

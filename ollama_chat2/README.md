@@ -1,6 +1,6 @@
 # ollama_chat2
 
-Ein interaktiver KI-Chat-Assistent mit Sprachsteuerung (Speech-to-Text und Text-to-Speech), basierend auf **Ollama** + **phi4**, **whisper.cpp** (STT) und **Piper TTS** (Sprachausgabe).
+Ein interaktiver KI-Chat-Assistent mit Sprachsteuerung (Speech-to-Text und Text-to-Speech), basierend auf **Ollama** + **phi4**, **whisper.cpp** (STT) und **Piper TTS** (Sprachausgabe). Modernes TUI mit Ratatui.
 
 ## Voraussetzungen
 
@@ -41,49 +41,69 @@ Beim ersten Start werden automatisch heruntergeladen:
 
 | Komponente | Größe | Quelle |
 |---|---|---|
-| **Whisper STT Modell** (`ggml-base.bin`) | ~145 MB | huggingface.co (ggerganov/whisper.cpp) |
-| **Whisper Binary** (`whisper.exe`) | ~4 MB | GitHub (whisper.cpp v1.8.6) |
+| **Whisper STT Modell** (`ggml-large-v3.bin`) | ~1,5 GB | huggingface.co (ggerganov/whisper.cpp) |
+| **Whisper Binary** (`whisper.exe` + DLLs) | ~4 MB | GitHub (whisper.cpp v1.8.6) |
 | **Piper TTS Binary** (`piper.exe` + DLLs) | ~22 MB | GitHub (rhasspy/piper) |
-| **Piper Deutsche Stimme** (`de_DE-thorsten-medium.onnx`) | ~63 MB | huggingface.co (rhasspy/piper-voices) |
+| **Piper Deutsche Stimme** (`de_DE-kerstin-low.onnx`) | ~63 MB | huggingface.co (rhasspy/piper-voices) |
 
 ## Features
 
-- **Voice Activity Detection (VAD)** – Sprache wird automatisch erkannt, keine Taste nötig
-- **Speech-to-Text** – whisper.cpp mit deutschem Sprachmodell (`-l de`)
-- **Text-to-Speech** – Piper TTS mit deutscher Neural-Stimme (Thorsten, medium)
-- **Ins-Wort-Fallen** – Sprich einfach, um die KI zu unterbrechen
+- **Always-on VAD** – Sprache wird automatisch erkannt, keine Taste nötig
+- **Speech-to-Text** – whisper.cpp mit deutschem Large-v3-Modell (`-l de -pp`)
+- **Text-to-Speech** – Piper TTS mit deutscher Stimme (Kerstin, weiblich)
+- **VAD Barge-in** – Sprich einfach, um die KI während der Sprachausgabe zu unterbrechen
 - **Enter-Taste** – Backup zum Stoppen der Sprachausgabe
-- **Exit** – Sage "Exit" oder tippe es ein
+- **Web Search** – DuckDuckGo Lite + Wikipedia, ausgelöst per Schlüsselwörtern
+- **Wetterabfrage** – Open-Meteo API (kostenlos, kein API-Key)
+- **URL-Fetching** – Webseiten-Inhalte abrufen und zusammenfassen
+- **Gesprächs-Gedächtnis** – Konversation wird in `conversation_history.json` gespeichert (nach jedem Durchlauf)
+- **Ratatui TUI** – Drei Fenster (Titel, Chat-Verlauf, Statusleiste)
+- **Exit** – `Esc`, `q` oder `Ctrl+C`
+
+## Bedienung
+
+| Taste | Aktion |
+|---|---|
+| `Esc` / `q` / `Ctrl+C` | Programm beenden |
+| `Enter` / `Space` | TTS-Stopp (Backup) |
+| `↑` / `↓` | Im Chat-Verlauf scrollen |
+
+Während der Sprachausgabe der KI: Einfach selbst zu sprechen beginnen → VAD Barge-in unterbricht die Ausgabe automatisch.
 
 ## Konfiguration
 
-Die Rolle des Assistenten wird beim Start per Spracheingabe oder Tastatur festgelegt.
+Das System-Prompt ist aktuell leer (`SYSTEM_PROMPT = ""` in `main.rs`). Zum Anpassen die Konstante in `main.rs` ändern.
 
 ## Abhängigkeiten (Cargo.toml)
 
 - `cpal` – Mikrofonzugriff
 - `hound` – WAV-Export
-- `reqwest` – Download von Modellen
+- `reqwest` – HTTP-Client (Download + Web Search + URL-Fetching)
 - `serde` / `serde_json` – JSON-Kommunikation mit Ollama
 - `futures-util` – Streaming der Ollama-Antwort
-- `owo-colors` – Farbige Konsolenausgabe
+- `owo-colors` – Farbige Konsolenausgabe (Pre-TUI)
 - `winreg` – Windows 11-Erkennung
 - `tokio` – Async-Runtime
+- `ratatui` – TUI-Framework
+- `crossterm` – Terminal-Steuerung (raw mode, Events)
+- `urlencoding` – URL-Encoding für Web Search
+- `regex` – HTML-Parsing für DuckDuckGo Lite
 
 ## Projektstruktur
 
 ```
 ollama_chat2/
 ├── src/
-│   └── main.rs          # Hauptprogramm
+│   └── main.rs                # Hauptprogramm (gesamte Logik)
 ├── Cargo.toml
 ├── README.md
-├── ggml-base.bin        # Whisper Modell (automatisch)
-├── whisper.exe          # Whisper Binary (automatisch)
-├── whisper.dll          # Whisper DLLs (automatisch)
-├── piper/               # Piper TTS (automatisch)
+├── ggml-large-v3.bin          # Whisper Modell (automatisch)
+├── whisper.exe                # Whisper Binary (automatisch)
+├── whisper.dll / ggml*.dll    # Whisper DLLs (automatisch)
+├── piper/                     # Piper TTS (automatisch)
 │   ├── piper.exe
-│   ├── de_DE-thorsten-medium.onnx
-│   └── ...
-└── target/              # Build-Output
+│   ├── de_DE-kerstin-low.onnx
+│   └── espeak-ng-data/
+├── conversation_history.json  # Gesprächsverlauf (automatisch)
+└── target/                    # Build-Output
 ```

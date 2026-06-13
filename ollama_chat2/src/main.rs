@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -49,6 +49,7 @@ const SYSTEM_PROMPT: &str = "";
 const HISTORY_FILE: &str = "conversation_history.json";
 
 static TTS_CANCEL: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 //-----------------------------------------------------------------------------
 // Types
@@ -85,16 +86,6 @@ enum Phase {
     Speaking,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-enum Emotion {
-    Neutral,
-    Happy,
-    Sad,
-    Angry,
-    Surprised,
-    Thinking,
-}
-
 struct AppState {
     messages: Vec<ChatEntry>,
     phase: Phase,
@@ -108,7 +99,6 @@ struct AppState {
     search_result: String,
     search_show_until: Option<std::time::Instant>,
     tts_stop: bool,
-    emotion: Emotion,
 }
 
 impl AppState {
@@ -126,7 +116,6 @@ impl AppState {
             search_result: String::new(),
             search_show_until: None,
             tts_stop: false,
-            emotion: Emotion::Neutral,
         }
     }
 }
@@ -921,6 +910,7 @@ fn record_audio_inner(cancel: Option<Arc<AtomicBool>>, state: Arc<Mutex<AppState
 
     stream.play()?;
     while !utterance_done.load(Ordering::Relaxed) {
+        if SHUTDOWN.load(Ordering::Relaxed) { return Err("Shutdown".into()); }
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(stream);
@@ -994,6 +984,7 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
         rx_stop.try_recv().is_ok()
         || cancel.load(Ordering::Relaxed)
         || TTS_CANCEL.load(Ordering::Relaxed)
+        || SHUTDOWN.load(Ordering::Relaxed)
         || state.try_lock().map(|s| s.tts_stop).unwrap_or(false)
     };
 
@@ -1015,7 +1006,7 @@ fn speak_text(text: &str, cancel: &AtomicBool, state: Arc<Mutex<AppState>>) -> R
         // Poll for Piper completion while checking stop flag
         loop {
             if let Ok(Some(_)) = piper_proc.try_wait() { break; }
-            if TTS_CANCEL.load(Ordering::Relaxed) { let _ = piper_proc.kill(); break; }
+            if TTS_CANCEL.load(Ordering::Relaxed) || SHUTDOWN.load(Ordering::Relaxed) { let _ = piper_proc.kill(); break; }
             if let Ok(s) = state.try_lock() {
                 if s.tts_stop { let _ = piper_proc.kill(); break; }
             }
@@ -1096,6 +1087,94 @@ fn load_history() -> Vec<Message> {
 }
 
 //-----------------------------------------------------------------------------
+// Always-on VAD monitor for TTS barge-in
+//-----------------------------------------------------------------------------
+
+fn start_vad_monitor(state: Arc<Mutex<AppState>>) {
+    std::thread::spawn(move || {
+        let host = match cpal::default_host() {
+            h => h,
+        };
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => { eprintln!("VAD monitor: no input device"); return; }
+        };
+        let config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("VAD monitor: {}", e); return; }
+        };
+        let sample_format = config.sample_format();
+        let stream_config: cpal::StreamConfig = config.into();
+        const BARGE_IN_THRESHOLD: f32 = 0.20;
+
+        let state_ref = Arc::clone(&state);
+        let result = match sample_format {
+            cpal::SampleFormat::F32 => {
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let peak = data.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+                        if let Ok(mut s) = state_ref.try_lock() {
+                            s.vad_level = peak;
+                            if peak > BARGE_IN_THRESHOLD && s.phase == Phase::Speaking {
+                                s.tts_stop = true;
+                                TTS_CANCEL.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    },
+                    move |err| eprintln!("VAD monitor error: {}", err),
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        let peak = data.iter().map(|&s| (s.abs() as f32) / i16::MAX as f32).fold(0.0f32, f32::max);
+                        if let Ok(mut s) = state_ref.try_lock() {
+                            s.vad_level = peak;
+                            if peak > BARGE_IN_THRESHOLD && s.phase == Phase::Speaking {
+                                s.tts_stop = true;
+                                TTS_CANCEL.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    },
+                    move |err| eprintln!("VAD monitor error: {}", err),
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        let peak = data.iter().map(|&s| ((s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)).abs()).fold(0.0f32, f32::max);
+                        if let Ok(mut s) = state_ref.try_lock() {
+                            s.vad_level = peak;
+                            if peak > BARGE_IN_THRESHOLD && s.phase == Phase::Speaking {
+                                s.tts_stop = true;
+                                TTS_CANCEL.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    },
+                    move |err| eprintln!("VAD monitor error: {}", err),
+                    None,
+                )
+            }
+            _ => { eprintln!("VAD monitor: unsupported format"); return; }
+        };
+
+        match result {
+            Ok(stream) => {
+                let _ = stream.play();
+                // Keep alive until the conversation loop exits (main thread)
+                loop { std::thread::sleep(Duration::from_secs(1)); }
+            }
+            Err(e) => eprintln!("VAD monitor: stream error: {}", e),
+        }
+    });
+}
+
+//-----------------------------------------------------------------------------
 // Conversation thread
 //-----------------------------------------------------------------------------
 
@@ -1121,12 +1200,16 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         }).collect();
     }
 
+    // Start always-on VAD monitor for TTS barge-in
+    start_vad_monitor(Arc::clone(&state));
+
     loop {
         // Check for exit (non-blocking)
         match cmd_rx.try_recv() {
             Ok(UiCommand::Exit) | Err(mpsc::TryRecvError::Disconnected) => break,
             _ => {}
         }
+        if SHUTDOWN.load(Ordering::Relaxed) { break; }
 
         // Listening phase
         {
@@ -1270,6 +1353,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             while let Ok(segment) = tts_rx.recv() {
                 if tts_cancel_tts.load(Ordering::Relaxed) { break; }
                 if TTS_CANCEL.load(Ordering::Relaxed) { break; }
+                if SHUTDOWN.load(Ordering::Relaxed) { break; }
                 // Also check state.stop
                 {
                     let s = tts_state.lock().unwrap();
@@ -1296,6 +1380,7 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         while let Some(chunk) = rt.block_on(stream.next()) {
             if tts_cancel.load(Ordering::Relaxed) { break; }
             if TTS_CANCEL.load(Ordering::Relaxed) { break; }
+            if SHUTDOWN.load(Ordering::Relaxed) { break; }
             // Also check if TUI thread requested stop via state
             if let Ok(s) = state.try_lock() {
                 if s.tts_stop { break; }
@@ -1332,10 +1417,6 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                                 if let Some(last) = s.messages.last_mut() {
                                     last.content = full_response.clone();
                                 }
-                                // Update emotion during streaming
-                                if full_response.len() > 10 {
-                                    s.emotion = detect_emotion(&full_response);
-                                }
                             }
                         }
                     }
@@ -1349,9 +1430,6 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
         }
         drop(tts_tx);
 
-        // Detect emotion from full response
-        let ai_emotion = detect_emotion(&full_response);
-
         let _ = tts_handle.join();
 
         {
@@ -1362,7 +1440,6 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
             s.phase = Phase::Listening;
             s.status_text = "Listening...".into();
             s.vu_level = 0.0;
-            s.emotion = ai_emotion;
         }
 
         if !full_response.is_empty() {
@@ -1384,92 +1461,10 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                 }
             }
         }
+        // Save after each turn in case of unclean exit
+        save_history(&history);
     }
     save_history(&history);
-}
-
-//-----------------------------------------------------------------------------
-// Emotion detection & ASCII face art
-//-----------------------------------------------------------------------------
-
-fn detect_emotion(text: &str) -> Emotion {
-    let lower = text.to_lowercase();
-    let has = |kws: &[&str]| kws.iter().any(|k| lower.contains(k));
-    if has(&["😂", "😊", "😄", "😍", "🥰", "freut", "lacht", "großartig",
-             "wunderbar", "fantastisch", "toll", "super", "begeistert",
-             "lustig", "schön", "glücklich", "fröhlich", "lächeln",
-             "yay", "juhu", "hurra", "herrlich"])
-    { return Emotion::Happy; }
-    if has(&["😢", "😭", "😔", "😞", "traurig", "schade", "bedauerlich",
-             "enttäuscht", "leid", "weinen", "kummer", "melancholie",
-             "einsam", "vermisst", "niedergeschlagen", "herzzerreißend"])
-    { return Emotion::Sad; }
-    if has(&["😠", "😡", "🤬", "wütend", "ärgerlich", "verärgert",
-             "frustriert", "genervt", "sauer", "empört", "zornig",
-             "rasend", "verflucht"])
-    { return Emotion::Angry; }
-    if has(&["😮", "😲", "😯", "😱", "überraschend", "unglaublich",
-             "erstaunlich", "verblüffend", "krass",
-             "tatsächlich", "aha", "bemerkenswert"])
-    { return Emotion::Surprised; }
-    if has(&["🤔", "🧐", "hmm", "überlege", "nachdenken", "vielleicht",
-             "möglicherweise", "interessant", "lasst mich", "mal sehen",
-             "gute frage", "schwierig", "überleg"])
-    { return Emotion::Thinking; }
-    Emotion::Neutral
-}
-
-fn face_lines(emotion: Emotion) -> &'static [&'static str] {
-    match emotion {
-        Emotion::Neutral => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| o   o |",
-            "|   ^   |",
-            " \\ ___ / ",
-            " Neutral ",
-        ],
-        Emotion::Happy => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| ^   ^ |",
-            "|   U   |",
-            " \\ ___ / ",
-            "  Happy  ",
-        ],
-        Emotion::Sad => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| .   . |",
-            "|   T   |",
-            " \\ ___ / ",
-            "   Sad   ",
-        ],
-        Emotion::Angry => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| >   < |",
-            "|   !   |",
-            " \\ ___ / ",
-            "  Angry  ",
-        ],
-        Emotion::Surprised => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| O   O |",
-            "|   o   |",
-            " \\ ___ / ",
-            "Surprised",
-        ],
-        Emotion::Thinking => &[
-            "  .---.  ",
-            " /     \\ ",
-            "| o   o |",
-            "|   ?   |",
-            " \\ ___ / ",
-            "Thinking ",
-        ],
-    }
 }
 
 //-----------------------------------------------------------------------------
@@ -1485,39 +1480,15 @@ fn ui(f: &mut ratatui::Frame, state: &AppState, scroll_offset: &mut usize) {
         .split(size);
 
     // Title
-    let title = Paragraph::new("Ollama Chat  —  Speech-to-Text  —  phi4 + whisper.cpp + Piper TTS")
+    let title = Paragraph::new("Ollama Chat  —  Speech-to-Text  —  phi4 + whisper.cpp + Piper TTS  |  Esc/q/Ctrl+C: quit")
         .block(Block::default().borders(Borders::ALL).title(" AI Chat "));
     f.render_widget(title, chunks[0]);
 
-    // Split chat area horizontally: conversation | face
-    let face_width: u16 = 22;
-    let (chat_rect, face_rect) = if size.width >= 60 && size.height >= 15 {
-        let horiz = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(face_width)])
-            .split(chunks[1]);
-        (horiz[0], horiz[1])
-    } else {
-        // Terminal too small, use full width for conversation, no face
-        (chunks[1], Rect::default())
-    };
-
-    // Conversation area
+    // Chat area
+    let chat_rect = chunks[1];
     let inner = Rect { x: chat_rect.x + 1, y: chat_rect.y + 1, width: chat_rect.width.saturating_sub(2), height: chat_rect.height.saturating_sub(2) };
     let block = Block::default().borders(Borders::ALL).title(" Conversation ");
     f.render_widget(block, chat_rect);
-
-    // Face area
-    if face_rect.width > 0 && face_rect.height > 0 {
-        let face_block = Block::default().borders(Borders::ALL).title(" AI ");
-        let face_inner = Rect { x: face_rect.x + 1, y: face_rect.y + 1, width: face_rect.width.saturating_sub(2), height: face_rect.height.saturating_sub(2) };
-        let lines = face_lines(state.emotion);
-        let max_visible = face_inner.height as usize;
-        let display_lines: Vec<Line> = lines.iter().take(max_visible).map(|l| Line::from(Span::raw(*l))).collect();
-        let face_para = Paragraph::new(display_lines);
-        f.render_widget(face_block, face_rect);
-        f.render_widget(face_para, face_inner);
-    }
 
 // Pre-wrap long lines at inner.width to keep lines.len() == visual lines
 let max_width = inner.width.saturating_sub(2) as usize;
@@ -1662,18 +1633,27 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
     let mut scroll_offset = 0usize;
 
     let res = loop {
+        if SHUTDOWN.load(Ordering::Relaxed) { break Ok(()); }
+
         {
             let state_guard = state.lock().unwrap();
             terminal.draw(|f| ui(f, &state_guard, &mut scroll_offset))?;
         }
 
-        // Handle keyboard
-        if event::poll(Duration::from_millis(50))? {
+        // Drain all queued events non-blocking
+        let mut exit = false;
+        while !exit && event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                    | KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        SHUTDOWN.store(true, Ordering::Relaxed);
+                        TTS_CANCEL.store(true, Ordering::Relaxed);
+                        if let Ok(mut s) = state.try_lock() {
+                            s.tts_stop = true;
+                        }
                         let _ = cmd_tx.send(UiCommand::Exit);
-                        break Ok(());
+                        exit = true;
                     }
                     KeyCode::Up => scroll_offset = scroll_offset.saturating_add(1),
                     KeyCode::Down => scroll_offset = scroll_offset.saturating_sub(1),
@@ -1687,6 +1667,8 @@ fn run_tui(state: Arc<Mutex<AppState>>, cmd_tx: mpsc::Sender<UiCommand>) -> Resu
                 }
             }
         }
+        if exit { break Ok(()); }
+        std::thread::sleep(Duration::from_millis(50));
     };
 
     disable_raw_mode()?;
@@ -1749,7 +1731,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn conversation thread
     let conv_state = Arc::clone(&state);
-    std::thread::spawn(move || {
+    let conv_handle = std::thread::spawn(move || {
         conversation_loop(conv_state, cmd_rx);
     });
 
@@ -1758,6 +1740,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{} {}", "TUI error:".red(), e);
     }
 
-    println!("\nGoodbye! 👋");
+    // Wait for conversation thread to finish (graceful shutdown)
+    let _ = conv_handle.join();
+
+    println!("\nGoodbye!");
     Ok(())
 }

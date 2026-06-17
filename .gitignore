@@ -10,3 +10,5 @@ target/
 Release/
 whisper-test-out/
 piper/
+
+conversation_history.json

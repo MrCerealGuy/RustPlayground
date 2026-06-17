@@ -1331,9 +1331,24 @@ fn conversation_loop(state: Arc<Mutex<AppState>>, cmd_rx: mpsc::Receiver<UiComma
                 s.phase = Phase::Listening;
                 s.status_text = "Listening...".into();
                 s.error = Some(format!("Ollama error: {}", e));
+                history.pop(); // remove the user message from history
+                if search_query.is_some() { history.pop(); } // remove search system message
                 continue;
             }
         };
+
+        // Check for HTTP errors (e.g. model overloaded)
+        if !response.status().is_success() {
+            let status_code = response.status();
+            let err_body = rt.block_on(async { response.text().await }).unwrap_or_default();
+            let mut s = state.lock().unwrap();
+            s.phase = Phase::Listening;
+            s.status_text = "Listening...".into();
+            s.error = Some(format!("Ollama error ({}): {}", status_code, err_body.trim()));
+            history.pop(); // remove user message
+            if search_query.is_some() { history.pop(); }
+            continue;
+        }
 
         // Stream processing + streaming TTS
         // Check if user pressed Enter during thinking
